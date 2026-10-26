@@ -19,3 +19,7 @@ app/build/generated/
 
 # OS
 .DS_Store
+
+# Debug log captures (device logcat dumps, not source)
+logcat-*.txt
+debug-context.txt
