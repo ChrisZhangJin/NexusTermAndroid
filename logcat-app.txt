@@ -1,0 +1,136 @@
+--------- beginning of main
+10-26 18:41:46.099 20344 20344 I xusterm.androi: Late-enabling -Xcheck:jni
+10-26 18:41:46.118 20344 20344 E xusterm.androi: Unknown bits set in runtime_flags: 0x8000
+10-26 18:41:47.140 20344 20344 I Perf    : Connecting to perf service.
+10-26 18:41:47.176 20344 20344 I FeatureParser: can't find sirius.xml in assets/device_features/,it may be in /system/etc/device_features
+10-26 18:41:47.179 20344 20344 W xusterm.android: type=1400 audit(0.0:3089): avc: denied { read } for name="u:object_r:vendor_displayfeature_prop:s0" dev="tmpfs" ino=21142 scontext=u:r:untrusted_app:s0:c240,c256,c512,c768 tcontext=u:object_r:vendor_displayfeature_prop:s0 tclass=file permissive=0
+10-26 18:41:47.187 20344 20344 E libc    : Access denied finding property "ro.vendor.df.effect.conflict"
+--------- beginning of system
+10-26 18:41:47.257 20344 20344 W Looper  : Slow Looper main: Long Msg: seq=2 plan=18:41:46.150  late=11ms wall=1094ms running=1028ms runnable=7ms h=android.app.ActivityThread$H w=110
+10-26 18:41:47.261 20344 20425 E Perf    : Fail to get file list com.nexusterm.android
+10-26 18:41:47.261 20344 20425 E Perf    : getFolderSize() : Exception_1 = java.lang.NullPointerException: Attempt to get length of null array
+10-26 18:41:47.262 20344 20425 E Perf    : Fail to get file list com.nexusterm.android
+10-26 18:41:47.262 20344 20425 E Perf    : getFolderSize() : Exception_1 = java.lang.NullPointerException: Attempt to get length of null array
+10-26 18:41:47.299 20344 20344 W Binder:intercep: type=1400 audit(0.0:3090): avc: denied { getattr } for path="/data/data/com.miui.contentcatcher" dev="mmcblk0p81" ino=2506795 scontext=u:r:untrusted_app:s0:c240,c256,c512,c768 tcontext=u:object_r:system_app_data_file:s0 tclass=dir permissive=0
+10-26 18:41:47.299 20344 20344 W Binder:intercep: type=1400 audit(0.0:3091): avc: denied { getattr } for path="/data/data/com.miui.contentcatcher" dev="mmcblk0p81" ino=2506795 scontext=u:r:untrusted_app:s0:c240,c256,c512,c768 tcontext=u:object_r:system_app_data_file:s0 tclass=dir permissive=0
+10-26 18:41:47.319 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:41:47.322 20344 20344 I chatty  : uid=10240(com.nexusterm.android) identical 1 line
+10-26 18:41:47.328 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:41:47.334 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/sdk/Token;-><init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V (greylist, linking, allowed)
+10-26 18:41:47.334 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/InterceptorProxy;->getWorkThread()Landroid/os/HandlerThread; (greylist, linking, allowed)
+10-26 18:41:47.335 20344 20429 D ViewContentFactory: initViewContentFetcherClass
+10-26 18:41:47.335 20344 20429 D ViewContentFactory: getInterceptorPackageInfo
+10-26 18:41:47.335 20344 20429 W xusterm.androi: Accessing hidden method Landroid/app/AppGlobals;->getInitialApplication()Landroid/app/Application; (greylist, linking, allowed)
+10-26 18:41:47.335 20344 20429 D ViewContentFactory: getInitialApplication took 1ms
+10-26 18:41:47.335 20344 20429 D ViewContentFactory: packageInfo.packageName: com.miui.catcherpatch
+10-26 18:41:47.344 20344 20429 D ViewContentFactory: initViewContentFetcherClass took 9ms
+10-26 18:41:47.344 20344 20429 I ContentCatcher: ViewContentFetcher : ViewContentFetcher
+10-26 18:41:47.344 20344 20429 D ViewContentFactory: createInterceptor took 10ms
+10-26 18:41:47.344 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/sdk/ContentCatcherManager;->getInstance()Lmiui/contentcatcher/sdk/ContentCatcherManager; (greylist, linking, allowed)
+10-26 18:41:47.345 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/sdk/ContentCatcherManager;->registerContentInjector(Lmiui/contentcatcher/sdk/Token;Lmiui/contentcatcher/sdk/injector/IContentDecorateCallback;)V (greylist, linking, allowed)
+10-26 18:41:47.346 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/sdk/ContentCatcherManager;->getPageConfig(Lmiui/contentcatcher/sdk/Token;)Lmiui/contentcatcher/sdk/data/PageConfig; (greylist, linking, allowed)
+10-26 18:41:47.346 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/sdk/data/PageConfig;->getFeatures()Ljava/util/ArrayList; (greylist, linking, allowed)
+10-26 18:41:47.346 20344 20429 W xusterm.androi: Accessing hidden method Lmiui/contentcatcher/sdk/data/PageConfig;->getCatchers()Ljava/util/ArrayList; (greylist, linking, allowed)
+10-26 18:41:47.401 20344 20344 W Looper  : Slow Looper main: Activity com.nexusterm.android/.MainActivity is 1105ms late (wall=144ms running=120ms ClientTransaction{ callbacks=[android.app.servertransaction.LaunchActivityItem] lifecycleRequest=android.app.servertransaction.ResumeActivityItem }) because of 2 msg, msg 2 took 1094ms (seq=2 running=1028ms runnable=7ms late=11ms h=android.app.ActivityThread$H w=110)
+10-26 18:41:47.401 20344 20344 W Looper  : Slow Looper main: Activity com.nexusterm.android/.MainActivity is 1250ms late (wall=0ms running=0ms ClientTransaction{ callbacks=[android.app.servertransaction.TopResumedActivityChangeItem] }) because of 3 msg, msg 2 took 1094ms (seq=2 running=1028ms runnable=7ms late=11ms h=android.app.ActivityThread$H w=110), msg 3 took 144ms (seq=3 running=120ms runnable=8ms io=4ms late=1105ms h=android.app.ActivityThread$H w=159)
+10-26 18:41:47.510 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:41:47.855 20344 20344 W xusterm.androi: Class androidx.compose.runtime.snapshots.SnapshotStateList failed lock verification and will run slower.
+10-26 18:41:47.855 20344 20344 W xusterm.androi: Common causes for lock verification issues are non-optimized dex code
+10-26 18:41:47.855 20344 20344 W xusterm.androi: and incorrect proguard optimizations.
+10-26 18:41:47.941 20344 20344 W xusterm.androi: Accessing hidden method Landroid/view/View;->getViewRootImpl()Landroid/view/ViewRootImpl; (greylist, reflection, allowed)
+10-26 18:41:47.941 20344 20344 W xusterm.androi: Accessing hidden field Landroid/view/View$AttachInfo;->mVisibleInsets:Landroid/graphics/Rect; (greylist, reflection, allowed)
+10-26 18:41:47.941 20344 20344 W xusterm.androi: Accessing hidden field Landroid/view/ViewRootImpl;->mAttachInfo:Landroid/view/View$AttachInfo; (greylist, reflection, allowed)
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: QUALCOMM build                   : 6cb3eb2, I8fa107637b
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: Build Date                       : 09/14/20
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: OpenGL ES Shader Compiler Version: EV031.27.05.01
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: Local Branch                     : 
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: Remote Branch                    : refs/tags/AU_LINUX_ANDROID_LA.UM.8.8.R1.10.00.00.545.051
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: Remote Branch                    : NONE
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: Reconstruct Branch               : NOTHING
+10-26 18:41:48.104 20344 20426 I AdrenoGLES: Build Config                     : S P 8.0.11 AArch64
+10-26 18:41:48.113 20344 20426 I AdrenoGLES: PFP: 0x016ee187, ME: 0x00000000
+10-26 18:41:48.117 20344 20426 W AdrenoUtils: <ReadGpuID_from_sysfs:198>: Failed to open /sys/class/kgsl/kgsl-3d0/gpu_model
+10-26 18:41:48.117 20344 20426 W AdrenoUtils: <ReadGpuID:222>: Failed to read chip ID from gpu_model. Fallback to use the GSL path
+10-26 18:41:48.109 20344 20344 W RenderThread: type=1400 audit(0.0:3100): avc: denied { search } for name="kgsl-3d0" dev="sysfs" ino=45096 scontext=u:r:untrusted_app:s0:c240,c256,c512,c768 tcontext=u:object_r:sysfs_kgsl:s0 tclass=dir permissive=0
+10-26 18:41:48.142 20344 20426 W Gralloc3: mapper 3.x is not supported
+10-26 18:41:48.271 20344 20426 E LB      : fail to open file: No such file or directory
+10-26 18:41:48.272 20344 20426 I OpenGLRenderer: Davey! duration=1112ms; Flags=1, IntendedVsync=7057483881373, Vsync=7057717214697, OldestInputEvent=9223372036854775807, NewestInputEvent=0, HandleInputStart=7057725958660, AnimationStart=7057726030379, PerformTraversalsStart=7057726236421, DrawStart=7058452046212, SyncQueued=7058464984493, SyncStart=7058465326785, IssueDrawCommandsStart=7058465423764, SwapBuffers=7058593324493, FrameCompleted=7058596337566, DequeueBufferDuration=109000, QueueBufferDuration=671000, 
+10-26 18:41:48.296 20344 20344 I Choreographer: Skipped 48 frames!  The application may be doing too much work on its main thread.
+10-26 18:41:48.302 20344 20344 W Looper  : Slow Looper main: doFrame is 802ms late because of 6 msg, msg 1 took 872ms (seq=6 running=676ms runnable=4ms io=1ms late=242ms h=android.view.Choreographer$FrameHandler c=android.view.Choreographer$FrameDisplayEventReceiver)
+10-26 18:41:52.962 20344 20456 D ProfileInstaller: Installing profile for com.nexusterm.android
+10-26 18:41:53.887 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.887 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.887 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putInt(Ljava/lang/Object;JI)V (greylist, linking, allowed)
+10-26 18:41:53.887 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getLong(Ljava/lang/Object;J)J (greylist,core-platform-api, linking, allowed)
+10-26 18:41:53.890 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putObject(Ljava/lang/Object;JLjava/lang/Object;)V (greylist, linking, allowed)
+10-26 18:41:53.890 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->objectFieldOffset(Ljava/lang/reflect/Field;)J (greylist,core-platform-api, linking, allowed)
+10-26 18:41:53.892 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putLong(Ljava/lang/Object;JJ)V (greylist, linking, allowed)
+10-26 18:41:53.895 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->allocateInstance(Ljava/lang/Class;)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->peekLong(JZ)J (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->pokeLong(JJZ)V (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->pokeInt(JIZ)V (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->peekInt(JZ)I (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->pokeByte(JB)V (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->peekByte(J)B (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->pokeByteArray(J[BII)V (greylist, reflection, allowed)
+10-26 18:41:53.897 20344 20344 W xusterm.androi: Accessing hidden method Llibcore/io/Memory;->peekByteArray(J[BII)V (greylist, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->arrayBaseOffset(Ljava/lang/Class;)I (greylist,core-platform-api, linking, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->arrayIndexScale(Ljava/lang/Class;)I (greylist, linking, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putInt(Ljava/lang/Object;JI)V (greylist, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getLong(Ljava/lang/Object;J)J (greylist,core-platform-api, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putLong(Ljava/lang/Object;JJ)V (greylist, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putObject(Ljava/lang/Object;JLjava/lang/Object;)V (greylist, reflection, allowed)
+10-26 18:41:53.898 20344 20344 W xusterm.androi: Accessing hidden field Ljava/nio/Buffer;->address:J (greylist, reflection, allowed)
+10-26 18:41:53.907 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.916 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.918 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.918 20344 20344 I chatty  : uid=10240(com.nexusterm.android) identical 7 lines
+10-26 18:41:53.918 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.924 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.924 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.924 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.925 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.927 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.932 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.932 20344 20344 I chatty  : uid=10240(com.nexusterm.android) identical 1 line
+10-26 18:41:53.932 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.933 20344 20350 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getInt(Ljava/lang/Object;J)I (greylist, linking, allowed)
+10-26 18:41:53.937 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.949 20344 20344 I chatty  : uid=10240(com.nexusterm.android) identical 1 line
+10-26 18:41:53.950 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.963 20344 20350 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->getObject(Ljava/lang/Object;J)Ljava/lang/Object; (greylist, linking, allowed)
+10-26 18:41:53.963 20344 20350 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putObject(Ljava/lang/Object;JLjava/lang/Object;)V (greylist, linking, allowed)
+10-26 18:41:54.022 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putObject(Ljava/lang/Object;JLjava/lang/Object;)V (greylist, linking, allowed)
+10-26 18:41:54.024 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putInt(Ljava/lang/Object;JI)V (greylist, linking, allowed)
+10-26 18:41:54.061 20344 20344 W xusterm.androi: Accessing hidden method Lsun/misc/Unsafe;->putObject(Ljava/lang/Object;JLjava/lang/Object;)V (greylist, linking, allowed)
+10-26 18:41:54.165 20344 20344 W InputEventReceiver: App Input: Dispatching InputEvent took 323ms in main thread! (MotionEvent: event_seq=2, seq=2658, action=ACTION_UP)
+10-26 18:41:54.168 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:41:54.171 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:41:54.189 20344 20344 W Looper  : Slow Looper main: doFrame is 308ms late because of 1 msg
+10-26 18:41:55.191 20344 20423 I xusterm.androi: ProcessProfilingInfo new_methods=11316 is saved saved_to_disk=1 resolve_classes_delay=8000
+10-26 18:42:02.718 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:42:37.232 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:42:37.258 20344 20344 I WebViewFactory: Loading com.google.android.webview version 87.0.4280.101 (code 428010133)
+10-26 18:42:37.321 20344 20344 W xusterm.androi: Accessing hidden method Landroid/os/Trace;->isTagEnabled(J)Z (greylist, reflection, allowed)
+10-26 18:42:37.322 20344 20344 W xusterm.androi: Accessing hidden method Landroid/os/Trace;->traceBegin(JLjava/lang/String;)V (greylist, reflection, allowed)
+10-26 18:42:37.322 20344 20344 W xusterm.androi: Accessing hidden method Landroid/os/Trace;->traceEnd(J)V (greylist, reflection, allowed)
+10-26 18:42:37.322 20344 20344 W xusterm.androi: Accessing hidden method Landroid/os/Trace;->asyncTraceBegin(JLjava/lang/String;I)V (greylist, reflection, allowed)
+10-26 18:42:37.322 20344 20344 W xusterm.androi: Accessing hidden method Landroid/os/Trace;->asyncTraceEnd(JLjava/lang/String;I)V (greylist, reflection, allowed)
+10-26 18:42:37.352 20344 20344 I cr_LibraryLoader: Loaded native library version number "87.0.4280.101"
+10-26 18:42:37.353 20344 20344 I cr_CachingUmaRecorder: Flushed 5 samples from 5 histograms.
+10-26 18:42:37.437 20344 20875 W chromium: [WARNING:dns_config_service_posix.cc(342)] Failed to read DnsConfig.
+10-26 18:42:37.525 20344 20344 D EgretLoader: EgretLoader(Context context)
+10-26 18:42:37.527 20344 20344 D EgretLoader: The context is not activity
+10-26 18:42:37.534 20344 20880 W xusterm.androi: Accessing hidden method Landroid/media/AudioManager;->getOutputLatency(I)I (greylist, reflection, allowed)
+10-26 18:42:37.541 20344 20880 W cr_media: Requires BLUETOOTH permission
+10-26 18:42:37.554 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:42:37.566 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:42:37.642 20344 20344 W Looper  : Slow Looper main: doFrame is 417ms late because of 2 msg, msg 1 took 418ms (seq=1559 running=253ms runnable=23ms io=100ms late=7ms h=android.view.Choreographer$FrameHandler c=android.view.Choreographer$FrameDisplayEventReceiver)
+10-26 18:42:54.451 20344 20344 D ViewRootImpl: [TouchInput][ViewRootImpl] KeyEvent { action=ACTION_DOWN, keyCode=KEYCODE_BACK, scanCode=0, metaState=0, flags=0x8, repeatCount=0, eventTime=7124770, downTime=7124770, deviceId=-1, source=0x101, displayId=0 }
+10-26 18:42:54.483 20344 20344 D ViewRootImpl: [TouchInput][ViewRootImpl] KeyEvent { action=ACTION_UP, keyCode=KEYCODE_BACK, scanCode=0, metaState=0, flags=0x8, repeatCount=0, eventTime=7124770, downTime=7124770, deviceId=-1, source=0x101, displayId=0 }
+10-26 18:42:56.863 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8
+10-26 18:42:56.875 20344 20344 D EgretLoader: EgretLoader(Context context)
+10-26 18:42:56.877 20344 20344 D EgretLoader: The context is not activity
+10-26 18:42:56.885 20344 20344 D ForceDarkHelper: updateByCheckExcludeList: pkg: com.nexusterm.android activity: com.nexusterm.android.MainActivity@d1f65a8

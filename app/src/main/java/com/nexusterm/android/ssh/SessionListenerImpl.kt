@@ -1,10 +1,13 @@
 package com.nexusterm.android.ssh
 
+import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import uniffi.nexus_core.AuthPrompt
 import uniffi.nexus_core.TerminalEventListener
+
+private const val TAG = "NexusTermListener"
 
 /**
  * Implements the Rust-defined [TerminalEventListener] callback interface
@@ -36,6 +39,7 @@ class SessionListenerImpl(
 ) : TerminalEventListener {
 
     override fun onData(sessionId: String, bytes: ByteArray) {
+        Log.d(TAG, "onData session=$sessionId bytes=${bytes.size} thread=${Thread.currentThread().name}")
         onDataCallback(sessionId, bytes)
     }
 
@@ -44,6 +48,7 @@ class SessionListenerImpl(
     }
 
     override fun onClosed(sessionId: String, reason: String) {
+        Log.d(TAG, "onClosed session=$sessionId reason=$reason")
         onClosedCallback(sessionId, reason)
     }
 

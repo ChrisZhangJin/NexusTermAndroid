@@ -1,6 +1,7 @@
 package com.nexusterm.android
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
@@ -27,6 +28,7 @@ import com.nexusterm.android.ui.SessionListScreen
 import com.nexusterm.android.ui.SftpScreen
 import com.nexusterm.android.ui.TerminalHandle
 import com.nexusterm.android.ui.TerminalScreen
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import uniffi.nexus_core.AuthMethod
@@ -73,6 +75,12 @@ class MainActivity : ComponentActivity() {
             // same chicken/egg resolution the vertical slice used.
             var terminalHandle by remember { mutableStateOf<TerminalHandle?>(null) }
             var closedReason by remember { mutableStateOf<String?>(null) }
+            // Bytes can (and routinely do — the shell banner/prompt lands
+            // almost immediately after connect) arrive before the
+            // TerminalScreen composable has even run its factory() and
+            // produced a TerminalHandle. Without this buffer they were
+            // silently dropped via `terminalHandle?.writeBase64(...)`.
+            val pendingTerminalData = remember { mutableListOf<ByteArray>() }
 
             MaterialTheme {
                 Surface(modifier = Modifier, color = MaterialTheme.colorScheme.background) {
@@ -94,14 +102,32 @@ class MainActivity : ComponentActivity() {
                                         try {
                                             val auth = authMethodFor(session)
                                             val listener = SessionListenerImpl(
-                                                onDataCallback = { _, bytes -> terminalHandle?.writeBase64(bytes) },
+                                                onDataCallback = { _, bytes ->
+                                                    // UniFFI calls this back on a tokio/JNI
+                                                    // background thread (see SessionListenerImpl),
+                                                    // but WebView.evaluateJavascript() is
+                                                    // main-thread-only — hop before writing.
+                                                    lifecycleScope.launch(Dispatchers.Main) {
+                                                        val handle = terminalHandle
+                                                        if (handle == null) {
+                                                            pendingTerminalData.add(bytes)
+                                                        } else {
+                                                            handle.writeBase64(bytes)
+                                                        }
+                                                    }
+                                                },
                                                 onPulseCallback = { /* hook up a heartbeat indicator later */ },
                                                 onClosedCallback = { _, reason ->
-                                                    closedReason = reason
-                                                    terminalHandle?.notifyClosed(reason)
+                                                    // Compose state + notifyClosed are both
+                                                    // main-thread-only too.
+                                                    lifecycleScope.launch(Dispatchers.Main) {
+                                                        closedReason = reason
+                                                        terminalHandle?.notifyClosed(reason)
+                                                    }
                                                 },
                                                 onAuthPromptCallback = { prompt -> promptUserForAnswer(prompt) },
                                             )
+                                            Log.d("NexusTermConnect", "connecting to ${session.host}:${session.port}")
                                             val handle = SshClient.connect(
                                                 host = session.host,
                                                 port = session.port.toInt(),
@@ -109,10 +135,13 @@ class MainActivity : ComponentActivity() {
                                                 auth = auth,
                                                 listener = listener,
                                             )
+                                            Log.d("NexusTermConnect", "connected, sessionId=${handle.sessionId}")
                                             terminalHandle = null
+                                            pendingTerminalData.clear()
                                             closedReason = null
                                             navController.navigate("terminal/${handle.sessionId}")
                                         } catch (e: SessionException) {
+                                            Log.e("NexusTermConnect", "connect failed", e)
                                             connectError = e.message ?: "连接失败"
                                         }
                                     }
@@ -138,7 +167,11 @@ class MainActivity : ComponentActivity() {
                             val liveSessionId = backStackEntry.arguments?.getString("liveSessionId") ?: ""
 
                             TerminalScreen(
-                                onReady = { handle -> terminalHandle = handle },
+                                onReady = { handle ->
+                                    terminalHandle = handle
+                                    pendingTerminalData.forEach { handle.writeBase64(it) }
+                                    pendingTerminalData.clear()
+                                },
                                 onInput = { text ->
                                     lifecycleScope.launch {
                                         SshClient.write(liveSessionId, text.toByteArray(Charsets.UTF_8))

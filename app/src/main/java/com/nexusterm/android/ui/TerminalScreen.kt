@@ -2,8 +2,12 @@ package com.nexusterm.android.ui
 
 import android.annotation.SuppressLint
 import android.util.Base64
+import android.util.Log
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -14,6 +18,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+
+private const val TAG = "NexusTermUI"
 
 /**
  * Hosts a WebView running the xterm.js bundle in
@@ -32,11 +38,42 @@ import kotlinx.coroutines.launch
  * reach into WebView internals.
  */
 class TerminalHandle(private val webView: WebView) {
+    // `window.NexusTerm` only exists once index.html's inline <script> has
+    // actually run — which is strictly after onPageFinished, not right
+    // after loadUrl() returns. Any bytes arriving before that (very likely,
+    // since the shell banner/prompt lands almost immediately after connect)
+    // would previously vanish silently behind the `window.NexusTerm && ...`
+    // guard. We buffer until [markPageReady] flips this, then flush in order.
+    @Volatile private var pageReady = false
+    private val pending = mutableListOf<ByteArray>()
+
+    internal fun markPageReady() {
+        synchronized(pending) {
+            pageReady = true
+            Log.d(TAG, "page ready, flushing ${pending.size} buffered chunk(s)")
+            pending.forEach { sendNow(it) }
+            pending.clear()
+        }
+    }
+
     fun writeBase64(bytes: ByteArray) {
+        Log.d(TAG, "writeBase64: ${bytes.size} bytes, pageReady=$pageReady")
+        synchronized(pending) {
+            if (!pageReady) {
+                pending.add(bytes)
+                return
+            }
+        }
+        sendNow(bytes)
+    }
+
+    private fun sendNow(bytes: ByteArray) {
         val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
         // Single-quoted JS string literal: base64's alphabet never contains
         // a `'`, `\`, or newline, so no escaping is needed here.
-        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.writeBase64('$b64');", null)
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.writeBase64('$b64');") { result ->
+            Log.d(TAG, "writeBase64 JS result=$result")
+        }
     }
 
     fun notifyClosed(reason: String) {
@@ -76,9 +113,28 @@ fun TerminalScreen(
                     },
                     "NexusAndroid",
                 )
-                webViewClient = android.webkit.WebViewClient()
+                val handle = TerminalHandle(this)
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        Log.d(TAG, "onPageFinished url=$url")
+                        handle.markPageReady()
+                    }
+                }
+                // Without this, any console.log/error/exception thrown by
+                // index.html's inline script (e.g. xterm.js failing to
+                // parse/load) is completely invisible in logcat — this was
+                // the single biggest blind spot while diagnosing the blank
+                // terminal.
+                webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                        Log.d(TAG, "console[${message.messageLevel()}] ${message.message()} " +
+                            "(${message.sourceId()}:${message.lineNumber()})")
+                        return true
+                    }
+                }
                 loadUrl("file:///android_asset/terminal/index.html")
-                onReady(TerminalHandle(this))
+                onReady(handle)
             }
         },
     )
