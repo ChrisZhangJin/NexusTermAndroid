@@ -1,0 +1,273 @@
+//! 网络错误 → 中文可读提示。
+//!
+//! SSH 的失败原因九成集中在 TCP 握手与认证两步，而 russh 只会把 `io::Error`
+//! 原样冒泡成 `Operation timed out (os error 60)` 这种对终端用户毫无意义的话。
+//! 这里统一做一次翻译：主文案给人类看，原始错误保留在尾部小字里便于排障。
+
+use std::io;
+use std::time::Duration;
+
+/// TCP 连接默认超时（秒）。局域网主机通常 1 秒内响应，10 秒足够宽容。
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 10;
+
+/// 超时上限，避免误填一个天文数字把 UI 永久卡在"连接中"。
+pub const MAX_CONNECT_TIMEOUT_SECS: u32 = 600;
+
+/// 主文案与原始错误之间的分隔符。前端据此把两者拆成大字与小字。
+pub const RAW_SUFFIX: &str = "\n\n原始错误：";
+
+pub const AUTH_FAILED: &str = "认证失败：用户名、密码或密钥不正确";
+
+/// 把可选的用户配置收敛成一个安全时长。
+pub fn resolve_timeout(secs: Option<u32>) -> Duration {
+    let s = secs
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS)
+        .min(MAX_CONNECT_TIMEOUT_SECS);
+    Duration::from_secs(u64::from(s))
+}
+
+/// 组装「友好提示 + 原始错误」。detail 为空或与主文案重复时只返回主文案。
+pub fn compose(message: &str, detail: &str) -> String {
+    let message = message.trim();
+    let detail = detail.trim();
+    if detail.is_empty() || detail == message {
+        return message.to_string();
+    }
+    format!("{}{}{}", message, RAW_SUFFIX, detail)
+}
+
+/// 超时专属文案。tokio 的 Elapsed 不带任何上下文，需要自己补 host/port。
+pub fn timeout_message(host: &str, port: u16, timeout: Duration) -> String {
+    format!(
+        "连接超时：{}:{} 在 {} 秒内没有响应。请检查 IP 是否正确、主机是否开机、\
+         是否在同一网络、防火墙是否放行 {} 端口",
+        host,
+        port,
+        timeout.as_secs(),
+        port
+    )
+}
+
+/// russh 的连接错误 → 中文提示。
+pub fn connect_error(host: &str, port: u16, err: &russh::Error) -> String {
+    match err {
+        russh::Error::IO(e) => io_error(host, port, e),
+        other => compose(
+            &format!("无法与 {}:{} 建立 SSH 连接", host, port),
+            &other.to_string(),
+        ),
+    }
+}
+
+/// 握手阶段错误 → 中文提示。
+///
+/// 与 [`connect_error`] 的区别：算法协商失败（`NoCommonAlgo`）是**老服务器**
+/// 最典型的症状，单独给一条能直接指向解决方向的文案，而不是甩一句英文。
+/// `legacy_tried` 表示最后一次尝试是否已带上旧算法，避免提示用户去做
+/// 一件客户端其实已经做过的事。
+pub fn handshake_error(host: &str, port: u16, err: &russh::Error, legacy_tried: bool) -> String {
+    if let russh::Error::NoCommonAlgo { kind, .. } = err {
+        return algorithm_mismatch(host, port, kind, legacy_tried);
+    }
+    connect_error(host, port, err)
+}
+
+/// 算法协商失败专属文案。
+fn algorithm_mismatch(
+    host: &str,
+    port: u16,
+    kind: &russh::AlgorithmKind,
+    legacy_tried: bool,
+) -> String {
+    let (what, advice) = match kind {
+        russh::AlgorithmKind::Kex => (
+            "密钥交换算法",
+            if legacy_tried {
+                "客户端已启用兼容模式（含 diffie-hellman-group14-sha1 / group1-sha1）仍然没有交集，\
+                 说明服务器端把这类算法也关掉了，或使用了更古老的 SSH 实现（如 OpenSSH 4.x）。\
+                 建议在服务器端升级 OpenSSH 或放开 KexAlgorithms。"
+            } else {
+                "该服务器只提供已被淘汰的旧算法，请在会话设置中开启「兼容旧版服务器」后重试。"
+            },
+        ),
+        russh::AlgorithmKind::Key => (
+            "主机密钥算法",
+            "服务器可能只提供 ssh-dss 等已废弃的主机密钥，建议在服务器端重新生成 RSA/Ed25519 主机密钥。",
+        ),
+        russh::AlgorithmKind::Cipher => (
+            "加密算法",
+            "服务器只提供 3des-cbc / arcfour 等已废弃的加密算法，建议在服务器端开放 aes-ctr 系列算法。",
+        ),
+        russh::AlgorithmKind::Mac => (
+            "消息认证算法",
+            "服务器只提供 hmac-md5 等已废弃的 MAC 算法，建议在服务器端开放 hmac-sha2 系列算法。",
+        ),
+        russh::AlgorithmKind::Compression => (
+            "压缩算法",
+            "服务器只提供 zlib 之外的压缩算法，建议在服务器端关闭压缩或开放 zlib。",
+        ),
+    };
+
+    // 主文案已经把「哪一种算法 + 怎么办」说清楚了，不再附英文原文
+    format!(
+        "算法协商失败：{}:{} 找不到双方都支持的{}。{}",
+        host, port, what, advice
+    )
+}
+
+/// TCP 错误码（BSD/macOS/Linux/Android 的 errno）。
+///
+/// 桌面版这里还列了一份 Windows 的 Winsock `WSAE*` 数值（= errno + 10000），
+/// Android 版不会跑在 Windows 上，已经按计划裁掉；只留 Unix errno。
+const ETIMEDOUT: &[i32] = &[60];
+const ECONNREFUSED: &[i32] = &[61];
+/// ENETUNREACH / EHOSTUNREACH
+const EUNREACH: &[i32] = &[51, 65];
+const EHOSTDOWN: &[i32] = &[64];
+const ECONNRESET: &[i32] = &[54];
+
+#[cfg(test)]
+mod errno {
+    pub const TIMEDOUT: i32 = 60;
+    pub const CONNREFUSED: i32 = 61;
+    pub const NETUNREACH: i32 = 51;
+}
+
+/// io::Error → 中文提示。
+///
+/// 先匹配 `raw_os_error()`（errno 比 ErrorKind 信息量大，能把「超时」和
+/// 「被拒绝」分开），再用 `ErrorKind` 兜底，保证各平台都有合理文案。
+pub fn io_error(host: &str, port: u16, err: &io::Error) -> String {
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+
+    // 主机名解析失败 —— 发生在 connect 之前，ErrorKind 通常是 Uncategorized
+    let unresolved_host =
+        err.kind() == io::ErrorKind::AddrNotAvailable && host.parse::<std::net::IpAddr>().is_err();
+
+    if lower.contains("nodename")
+        || lower.contains("name or service not known")
+        || lower.contains("failed to lookup address")
+        || lower.contains("no address associated")
+        || unresolved_host
+    {
+        return compose(
+            &format!("无法解析主机名 {}：请检查拼写，或改用 IP 地址", host),
+            &msg,
+        );
+    }
+
+    let code = err.raw_os_error();
+    let kind = err.kind();
+    let is = |codes: &[i32]| code.is_some_and(|c| codes.contains(&c));
+
+    // errno 优先：同一件事在 ErrorKind 里常被归并成 Uncategorized，
+    // 只有原始码能把「超时」和「被拒绝」分开。ErrorKind 作为各平台的兜底。
+    if is(ETIMEDOUT) || kind == io::ErrorKind::TimedOut {
+        return compose(
+            &format!(
+                "连接超时：{}:{} 无响应。请检查 IP 是否正确、主机是否开机、\
+                 是否在同一网络、防火墙是否放行 {} 端口",
+                host, port, port
+            ),
+            &msg,
+        );
+    }
+    if is(ECONNREFUSED) || kind == io::ErrorKind::ConnectionRefused {
+        return compose(
+            &format!("连接被拒绝：{}:{} 端口未开放或服务未启动", host, port),
+            &msg,
+        );
+    }
+    if is(EUNREACH) {
+        return compose(
+            &format!("网络不可达：{} 不在可达网段内，请检查本机网络与路由", host),
+            &msg,
+        );
+    }
+    if is(EHOSTDOWN) {
+        return compose(&format!("主机已关机：{} 无响应", host), &msg);
+    }
+    if is(ECONNRESET) || kind == io::ErrorKind::ConnectionReset {
+        return compose(
+            &format!("连接被重置：{}:{} 主动断开了握手", host, port),
+            &msg,
+        );
+    }
+    if kind == io::ErrorKind::ConnectionAborted {
+        return compose(
+            &format!("连接被中止：{}:{} 未通过防火墙校验", host, port),
+            &msg,
+        );
+    }
+    if kind == io::ErrorKind::PermissionDenied {
+        return compose(
+            &format!("本机拒绝发起连接：{}:{}，请检查系统防火墙或 VPN", host, port),
+            &msg,
+        );
+    }
+    compose(
+        &format!("无法连接到 {}:{}：{}", host, port, kind_label(kind)),
+        &msg,
+    )
+}
+
+fn kind_label(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::TimedOut => "连接超时",
+        io::ErrorKind::ConnectionRefused => "端口未开放",
+        io::ErrorKind::ConnectionReset => "连接被重置",
+        io::ErrorKind::ConnectionAborted => "连接被中止",
+        io::ErrorKind::NotConnected => "网络未连接",
+        io::ErrorKind::AddrNotAvailable => "地址不可用",
+        io::ErrorKind::AddrInUse => "地址被占用",
+        io::ErrorKind::PermissionDenied => "权限不足",
+        _ => "网络错误",
+    }
+}
+
+/// 认证阶段统一文案。russh 的认证错误不区分"密码错"和"账号不存在"，
+/// 出于安全考虑也不该区分，因此统一提示。
+pub fn auth_error(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() || detail == AUTH_FAILED {
+        return AUTH_FAILED.to_string();
+    }
+    format!("{}{}{}", AUTH_FAILED, RAW_SUFFIX, detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_drops_duplicate_detail() {
+        assert_eq!(compose("网络不可达", "网络不可达"), "网络不可达");
+        assert_eq!(compose("网络不可达", ""), "网络不可达");
+        assert_eq!(
+            compose("网络不可达", "os error 51"),
+            "网络不可达\n\n原始错误：os error 51"
+        );
+    }
+
+    #[test]
+    fn timeout_default_is_ten_seconds() {
+        assert_eq!(resolve_timeout(None).as_secs(), 10);
+        assert_eq!(resolve_timeout(Some(0)).as_secs(), 10);
+        assert_eq!(resolve_timeout(Some(9999)).as_secs(), 600);
+    }
+
+    /// 用本平台真实的 errno 断言，顺带锁住「Windows 用 WSAE*」这个事实
+    #[test]
+    fn errno_maps_to_expected_copy() {
+        let timed_out = io::Error::from_raw_os_error(errno::TIMEDOUT);
+        assert!(io_error("1.2.3.4", 22, &timed_out).starts_with("连接超时"));
+
+        let refused = io::Error::from_raw_os_error(errno::CONNREFUSED);
+        assert!(io_error("1.2.3.4", 22, &refused).starts_with("连接被拒绝"));
+
+        let unreach = io::Error::from_raw_os_error(errno::NETUNREACH);
+        assert!(io_error("1.2.3.4", 22, &unreach).starts_with("网络不可达"));
+    }
+}
