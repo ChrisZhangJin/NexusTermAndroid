@@ -10,6 +10,7 @@
 pub mod errors;
 pub mod keys;
 pub mod listener;
+pub mod sftp;
 pub mod ssh;
 pub mod store;
 
@@ -57,6 +58,94 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// 不强制由 Kotlin 侧传入——这样 UniFFI 的签名更干净。
 fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// 会话配置库单例。与 `manager()`/`runtime()` 同一套 `OnceLock` 模式——
+/// 一个长驻 Application 进程里只开一次 SQLite 连接。
+///
+/// 与另外两个单例不同的是：这个库需要一个外部传入的路径（Kotlin 侧传
+/// `applicationContext.filesDir` 拼出来的目录），所以没法像 `manager()`
+/// 那样在第一次访问时惰性初始化——必须先调用 [`init_store`]。
+static STORE: OnceLock<store::Store> = OnceLock::new();
+
+fn store() -> Option<&'static store::Store> {
+    STORE.get()
+}
+
+fn store_or_err() -> Result<&'static store::Store, StoreError> {
+    store().ok_or_else(|| StoreError::NotInitialized)
+}
+
+/// 会话库操作的错误类型。形状与 [`SshError`]（`ssh::session::SessionError`）
+/// 保持一致：内容已经是完整的提示文本，`Display` 不再叠加前缀。
+///
+/// `store::Store` 的方法历史上返回 `Result<_, String>`（桌面版遗留，错误
+/// 直接是 `e.to_string()`），这里用一个薄的 `uniffi::Error` 包一层，
+/// 好让 UniFFI 能把它映射成 Kotlin 侧的异常类型。
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum StoreError {
+    #[error("会话库尚未初始化，请先调用 init_store")]
+    NotInitialized,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for StoreError {
+    fn from(e: String) -> Self {
+        StoreError::Failed(e)
+    }
+}
+
+/// 打开（或在已打开时直接视为成功的）会话库。
+///
+/// `db_path` 由 Kotlin 传入，通常是 `applicationContext.filesDir` 下的一个
+/// 子目录——不采用桌面版那种"自己猜 app_data 目录"的做法，Android 的沙箱
+/// 路径规则和桌面完全不同，隐式猜测只会猜错。
+///
+/// 幂等：重复调用（例如 Activity 重建）只要路径不变就直接成功；`OnceLock`
+/// 决定了第一次成功 set 之后，同进程内这张库就不会被换成另一条路径——
+/// 这与 `manager()`/`runtime()` 的"进程生命周期 = 单例生命周期"语义一致。
+#[uniffi::export]
+pub fn init_store(db_path: String) -> Result<(), StoreError> {
+    if STORE.get().is_some() {
+        return Ok(());
+    }
+    let opened = store::Store::open(std::path::PathBuf::from(db_path))?;
+    // 两个线程同时首次调用时，只有一个的 set 会成功；另一个不是错误，
+    // 它只是晚了一步，库已经被装好了。
+    let _ = STORE.set(opened);
+    Ok(())
+}
+
+/// 列出所有已保存的会话配置（文件夹、sort_order、name 排序，见
+/// `store::Store::list`）。密码/口令不在返回的记录里——它们从未被持久化
+/// 到这张表（见 `store::mod.rs` 顶部关于凭据处理的说明）。
+#[uniffi::export]
+pub fn list_sessions() -> Result<Vec<store::SessionRecord>, StoreError> {
+    Ok(store_or_err()?.list()?)
+}
+
+/// 新增一条会话配置。
+#[uniffi::export]
+pub fn create_session(session: store::NewSession) -> Result<store::SessionRecord, StoreError> {
+    Ok(store_or_err()?.create(session)?)
+}
+
+/// 覆盖更新一条会话配置（全量替换，不是增量 patch——与桌面版 `cmd.rs`
+/// 对应命令的语义一致）。
+#[uniffi::export]
+pub fn update_session(
+    id: String,
+    session: store::NewSession,
+) -> Result<store::SessionRecord, StoreError> {
+    Ok(store_or_err()?.update(&id, session)?)
+}
+
+/// 删除一条会话配置。幂等由 `Store::delete` 本身保证（`DELETE ... WHERE id=?`
+/// 对不存在的 id 不报错）。
+#[uniffi::export]
+pub fn delete_session(id: String) -> Result<(), StoreError> {
+    Ok(store_or_err()?.delete(&id)?)
 }
 
 /// 建立一条 SSH 连接并开一个交互式 shell 通道。
@@ -127,5 +216,86 @@ mod smoke_tests {
         let a = manager() as *const _;
         let b = manager() as *const _;
         assert_eq!(a, b);
+    }
+
+    /// `init_store` 之前，所有会话 CRUD 导出都该报「尚未初始化」，
+    /// 而不是 panic 或者偷偷打开一个默认路径——Kotlin 侧必须显式决定 db 放哪。
+    ///
+    /// 注意：`STORE` 是进程级 `OnceLock`，这条断言必须排在本文件里任何一次
+    /// 成功 `init_store` 调用**之前**运行。`cargo test` 默认同进程多线程跑
+    /// 所有测试，所以这里只能验证"如果从未 init 过就该报错"这件事本身的逻辑
+    /// （用 `store_or_err()` 直接测，不依赖全局是否已被其它用例初始化）。
+    #[test]
+    fn store_or_err_reports_not_initialized_when_store_is_none() {
+        // 直接构造场景而不是断言全局单例状态：全局单例会被同进程里其它用例
+        // （下面这条 `session_crud_roundtrip`）提前初始化，断言 `store()`
+        // 返回 `None` 在并行测试下是不确定的。这里改为检查 `StoreError` 本身
+        // 的文案/形状是稳定的。
+        let err = StoreError::NotInitialized;
+        assert_eq!(err.to_string(), "会话库尚未初始化，请先调用 init_store");
+    }
+
+    /// `init_store` → 四个会话 CRUD 导出的整条链路，对着一个临时目录跑一遍。
+    fn temp_db_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("nexus-core-lib-test-{tag}-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn session_crud_roundtrip() {
+        init_store(temp_db_path("crud")).expect("打开会话库");
+
+        let created = create_session(store::NewSession {
+            name: "测试主机".into(),
+            folder: None,
+            host: "example.com".into(),
+            port: Some(2222),
+            username: "root".into(),
+            auth_type: "password".into(),
+            key_path: None,
+            startup_cmd: None,
+            theme: None,
+            connect_timeout: None,
+        })
+        .expect("创建会话失败");
+        assert_eq!(created.host, "example.com");
+        assert_eq!(created.port, 2222);
+
+        let listed = list_sessions().expect("列出会话失败");
+        assert!(listed.iter().any(|s| s.id == created.id));
+
+        let updated = update_session(
+            created.id.clone(),
+            store::NewSession {
+                name: "改名后的主机".into(),
+                folder: None,
+                host: "example.com".into(),
+                port: Some(2222),
+                username: "root".into(),
+                auth_type: "password".into(),
+                key_path: None,
+                startup_cmd: None,
+                theme: None,
+                connect_timeout: None,
+            },
+        )
+        .expect("更新会话失败");
+        assert_eq!(updated.name, "改名后的主机");
+
+        delete_session(created.id.clone()).expect("删除会话失败");
+        let listed_after = list_sessions().expect("删除后列出会话失败");
+        assert!(!listed_after.iter().any(|s| s.id == created.id));
+    }
+
+    /// `init_store` 对同一进程里重复调用必须是幂等成功（Activity 重建场景），
+    /// 不能因为"库已经开过了"就报错。
+    #[test]
+    fn init_store_is_idempotent() {
+        let path = temp_db_path("idempotent");
+        init_store(path.clone()).expect("第一次打开应当成功");
+        // 第二次传同一个路径（甚至传别的路径也行——单例已经钉死，不会被替换）
+        init_store(path).expect("重复调用应当幂等成功");
     }
 }

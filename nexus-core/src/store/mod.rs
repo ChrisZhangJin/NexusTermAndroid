@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
     pub id: String,
@@ -27,7 +27,7 @@ pub struct SessionRecord {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSession {
     pub name: String,
@@ -437,52 +437,13 @@ impl Store {
         Ok(rows)
     }
 
-    /// 保存明文密码（随 db 持久化，便于跨机器迁移）。
-    pub fn set_password(&self, id: &str, password: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE sessions SET password = ?2 WHERE id = ?1",
-            params![id, password],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// 读取明文密码。
-    pub fn get_password(&self, id: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT password FROM sessions WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
-    }
-
-    /// 保存私钥口令。空串视为「清除」——避免把空口令当成有效口令传给解密流程。
-    pub fn set_passphrase(&self, id: &str, passphrase: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE sessions SET passphrase = ?2 WHERE id = ?1",
-            params![id, passphrase],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn get_passphrase(&self, id: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
-        conn.query_row(
-            "SELECT passphrase FROM sessions WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
-    }
+    // Android 版的部署决定：密码 / 私钥口令一律不进 Rust/SQLite，
+    // 由 Kotlin 侧直接写 Android EncryptedSharedPreferences（按 session id 建索引）。
+    // 桌面版这里原有的 `set_password`/`get_password`/`set_passphrase`/`get_passphrase`
+    // 明文落库方法整段删掉——不只是不对 UniFFI 导出，Rust 代码里也不再有
+    // 读写这两列的入口。`password`/`passphrase` 两个 SQLite 列仍保留在表结构
+    // 里（删列需要重建表，且旧 db 可能已经写过桌面版的测试数据），但现在
+    // 没有任何代码再碰它们。
 
     // ——— 密钥库 ———
 
