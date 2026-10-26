@@ -95,6 +95,19 @@ fun TerminalScreen(
         modifier = Modifier.fillMaxSize(),
         factory = {
             WebView(context).apply {
+                // Without explicit layoutParams, a WebView created inside an
+                // AndroidView factory can end up measured at a near-zero
+                // height — Blink's CSS `height: 100%` is relative to this
+                // native View's measured size, not to Compose's
+                // Modifier.fillMaxSize() on the AndroidView wrapper. This
+                // was the actual cause of the "blank" terminal: JS executed
+                // and term.write() succeeded with zero errors (confirmed
+                // via logcat), but the painted surface had collapsed to
+                // nothing to paint into.
+                layoutParams = android.view.ViewGroup.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                )
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 // Keystrokes/resize come back through this bridge object,
