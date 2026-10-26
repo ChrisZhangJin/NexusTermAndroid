@@ -66,6 +66,20 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
+    // Milestone 2: session list / add-edit / SFTP routes replace MainActivity's
+    // manual two-state screen switch with a real nav graph.
+    implementation("androidx.navigation:navigation-compose:2.8.0")
+
+    // Session passwords / private-key passphrases are deliberately never sent
+    // to nexus-core / SQLite (see nexus-core/src/store/mod.rs) — they live
+    // here, in a per-app encrypted file keyed by session id.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Local side of the SFTP file browser uses Storage Access Framework
+    // (ACTION_OPEN_DOCUMENT_TREE / DocumentFile) instead of java.io.File,
+    // since API 30+ scoped storage blocks arbitrary filesystem root access.
+    implementation("androidx.documentfile:documentfile:1.0.1")
+
     // Generated bindings call into the JNA-less UniFFI runtime via JNI
     // directly on modern uniffi-kotlin (no extra JNA dependency needed for
     // 0.28+'s default "jna"-free Kotlin target as long as the loader can
