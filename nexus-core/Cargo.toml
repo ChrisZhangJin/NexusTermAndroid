@@ -1,0 +1,64 @@
+[package]
+name = "nexus-core"
+version = "0.1.0"
+description = "NexusTerm Android 的 Rust SSH/SFTP 核心（从 NexusTerm 桌面版 fork）"
+authors = ["chris"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "nexus_core"
+# cdylib: Android 通过 JNI 加载的共享库
+# staticlib: 便于将来静态链接进其他宿主（iOS 等）
+# rlib: 让 cargo test / cargo check 在宿主目标上正常工作
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+russh = "0.49"
+russh-sftp = "2"
+ssh-key = { version = "0.6", features = ["ed25519", "rsa", "ecdsa", "encryption"] }
+# 生成密钥需要密码学安全随机源，必须是 0.6（与 ssh-key 0.6 的 CryptoRngCore 对齐）。
+rand_core = { version = "0.6", features = ["getrandom"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+sha2 = "0.10"
+
+# —— PuTTY .ppk 支持 ——
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha1 = "0.10"
+argon2 = "0.5"
+ssh-encoding = "0.2"
+parking_lot = "0.12"
+regex = "1"
+
+uniffi = { version = "0.28", features = ["cli"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+# 就地修补 russh 0.49.2 与 russh-sftp：见 vendor/*/PATCHES.md。
+# 修复 2FA/keyboard-interactive 认证会挂起的真实缺陷，必须保留。
+[patch.crates-io]
+russh = { path = "vendor/russh" }
+russh-sftp = { path = "vendor/russh-sftp" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "unwind"
+strip = true

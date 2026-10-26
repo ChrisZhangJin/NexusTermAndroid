@@ -1,0 +1,21 @@
+# Rust
+/target
+nexus-core/target
+Cargo.lock
+
+# Android / Gradle
+.gradle/
+local.properties
+*.iml
+.idea/
+/build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+app/src/main/jniLibs/
+nexus-core/src/uniffi/
+app/build/generated/
+
+# OS
+.DS_Store
