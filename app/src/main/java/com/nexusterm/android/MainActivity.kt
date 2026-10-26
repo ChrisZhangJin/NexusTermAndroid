@@ -33,7 +33,7 @@ import uniffi.nexus_core.AuthMethod
 import uniffi.nexus_core.AuthPrompt
 import uniffi.nexus_core.NewSession
 import uniffi.nexus_core.SessionRecord
-import uniffi.nexus_core.SshException
+import uniffi.nexus_core.SessionException
 import uniffi.nexus_core.StoreException
 
 /**
@@ -112,7 +112,7 @@ class MainActivity : ComponentActivity() {
                                             terminalHandle = null
                                             closedReason = null
                                             navController.navigate("terminal/${handle.sessionId}")
-                                        } catch (e: SshException) {
+                                        } catch (e: SessionException) {
                                             connectError = e.message ?: "连接失败"
                                         }
                                     }

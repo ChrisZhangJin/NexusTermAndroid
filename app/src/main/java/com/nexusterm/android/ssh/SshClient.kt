@@ -4,7 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.nexus_core.AuthMethod
 import uniffi.nexus_core.SessionHandle
-import uniffi.nexus_core.SshException
+import uniffi.nexus_core.SessionException
 import uniffi.nexus_core.TerminalEventListener
 import uniffi.nexus_core.connect as uniffiConnect
 import uniffi.nexus_core.disconnect as uniffiDisconnect
@@ -30,7 +30,7 @@ object SshClient {
      * events (pulse/closed) and must answer any keyboard-interactive / key
      * passphrase prompts synchronously (see [TerminalEventListener.onAuthPrompt]).
      *
-     * @throws SshException on handshake/auth/channel failure — callers
+     * @throws SessionException on handshake/auth/channel failure — callers
      *   should catch this and surface `message` to the user (nexus-core
      *   already translates russh's raw errors into Chinese human-readable
      *   text, see nexus-core/src/errors.rs).

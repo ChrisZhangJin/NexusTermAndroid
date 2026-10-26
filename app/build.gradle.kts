@@ -49,8 +49,9 @@ android {
     sourceSets {
         getByName("main") {
             kotlin.srcDir("${layout.buildDirectory.get()}/generated/uniffi")
-            // cargo-ndk / rust-android-gradle writes the per-ABI .so files here.
-            jniLibs.srcDir("src/main/jniLibs")
+            // org.mozilla.rust-android-gradle.rust-android's cargoBuild task already
+            // registers build/rustJniLibs/android/<abi>/ as a jniLibs source dir itself
+            // — adding it again here caused a "duplicate resources" merge failure.
         }
     }
 }
@@ -137,20 +138,30 @@ tasks.whenTaskAdded {
 val generateUniffiBindings by tasks.registering(Exec::class) {
     dependsOn("cargoBuild")
     val outDir = layout.buildDirectory.dir("generated/uniffi").get().asFile
-    val soPath = file("src/main/jniLibs/arm64-v8a/libnexus_core.so")
+    // uniffi-bindgen's `--library` mode dlopens the given shared library in-process
+    // to read its embedded metadata, so it MUST be a host-architecture build (glibc
+    // x86_64), not one of the cross-compiled Android .so's cargo-ndk produced — those
+    // can't be dlopen'd on this host. We build a throwaway host-target `cargo build`
+    // (debug, fast) purely so uniffi-bindgen has something it can load; the metadata
+    // is identical across all target triples, only the machine code differs.
     doFirst {
         outDir.mkdirs()
+        exec {
+            workingDir = file("../nexus-core")
+            commandLine("cargo", "build", "--lib")
+        }
     }
-    workingDir = file("..")
+    val hostSoPath = file("../nexus-core/target/debug/libnexus_core.so")
+    workingDir = file("../nexus-core")
     commandLine(
         "cargo", "run",
-        "--manifest-path", "nexus-core/Cargo.toml",
         "--bin", "uniffi-bindgen",
         "--",
         "generate",
-        "--library", soPath.absolutePath,
+        "--library",
         "--language", "kotlin",
-        "--out-dir", outDir.absolutePath
+        "--out-dir", outDir.absolutePath,
+        hostSoPath.absolutePath
     )
 }
 
