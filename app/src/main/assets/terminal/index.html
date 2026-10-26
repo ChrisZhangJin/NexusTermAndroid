@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!--
+  Minimal xterm.js host page, loaded from app/src/main/assets/terminal/ into
+  a WebView by ui/TerminalScreen.kt.
+
+  Bridge contract with Kotlin (see ssh/SessionListenerImpl.kt and
+  ui/TerminalScreen.kt):
+    Kotlin -> JS:  webView.evaluateJavascript("window.NexusTerm.writeBase64('...')", null)
+                   webView.evaluateJavascript("window.NexusTerm.notifyClosed('reason')", null)
+    JS -> Kotlin:  window.NexusAndroid.onTermInput(utf8OrBase64String)   // keystrokes
+                   window.NexusAndroid.onResize(cols, rows)              // on fit()
+  `NexusAndroid` is the addJavascriptInterface() object registered by
+  TerminalScreen.kt. Everything here is deliberately framework-free (no
+  bundler): it's a straight copy/trim of the xterm.js UMD build used by the
+  desktop app's frontend, wired up by hand.
+-->
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<link rel="stylesheet" href="xterm/xterm.css" />
+<style>
+  html, body { height: 100%; margin: 0; padding: 0; background: #0c0c0c; overflow: hidden; }
+  #terminal { height: 100%; width: 100%; }
+  .xterm { padding: 4px; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script src="xterm/xterm.js"></script>
+<script src="xterm/addon-fit.js"></script>
+<script>
+(function () {
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: "monospace",
+    theme: { background: "#0c0c0c", foreground: "#e6e6e6" },
+    scrollback: 5000,
+  });
+  var fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById("terminal"));
+  fitAddon.fit();
+
+  // Keystrokes / pasted text -> Kotlin. We send raw strings (xterm already
+  // gives us UTF-16 JS strings); Kotlin re-encodes to UTF-8 bytes before
+  // handing them to nexus-core's write(). This mirrors the desktop app's
+  // "whatever xterm emits, forward untouched" behaviour for key handling.
+  term.onData(function (data) {
+    if (window.NexusAndroid && window.NexusAndroid.onTermInput) {
+      window.NexusAndroid.onTermInput(data);
+    }
+  });
+
+  function reportSize() {
+    if (window.NexusAndroid && window.NexusAndroid.onResize) {
+      window.NexusAndroid.onResize(term.cols, term.rows);
+    }
+  }
+
+  window.addEventListener("resize", function () {
+    fitAddon.fit();
+    reportSize();
+  });
+
+  // Called once the page is visible so the first resize report reaches
+  // Kotlin before any data arrives (cols/rows must be set before PTY/shell
+  // request on the Rust side -- see SshClient.kt).
+  reportSize();
+
+  // ---- Kotlin -> JS bridge object ----
+  // Must be attached to `window` *after* `term` exists, since Kotlin may
+  // start calling writeBase64() immediately after the page finishes loading.
+  window.NexusTerm = {
+    /**
+     * Push a base64-encoded chunk of terminal output (raw SSH channel
+     * bytes). We decode to a byte string and hand it to term.write(), which
+     * accepts Uint8Array | string and understands partial UTF-8 sequences
+     * across calls -- exactly the property we need given nexus-core streams
+     * raw, possibly-split-mid-character bytes (see ssh/session.rs comment
+     * on why the desktop version avoided lossy UTF-8 conversion).
+     */
+    writeBase64: function (b64) {
+      var binary = atob(b64);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      term.write(bytes);
+    },
+    notifyClosed: function (reason) {
+      term.write("\r\n\x1b[31m[connection closed: " + reason + "]\x1b[0m\r\n");
+    },
+    clear: function () {
+      term.clear();
+    },
+    fit: function () {
+      fitAddon.fit();
+      reportSize();
+    },
+  };
+})();
+</script>
+</body>
+</html>
