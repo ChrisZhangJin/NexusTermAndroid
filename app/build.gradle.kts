@@ -18,6 +18,29 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // AGP auto-generates its debug keystore into the *container's* ~/.android/,
+    // which is destroyed by every `docker compose up --force-recreate`. A new
+    // key means a new signature, which means `adb install -r` fails with
+    // INSTALL_FAILED_UPDATE_INCOMPATIBLE and the app has to be uninstalled —
+    // taking the user's saved sessions and stored passwords with it. Pointing
+    // debug builds at a keystore on the persistent toolchain mount makes them
+    // reinstallable across container rebuilds. No-ops on a normal dev machine,
+    // where neither env var is set.
+    signingConfigs {
+        getByName("debug") {
+            val persistent = (
+                System.getenv("NEXUSTERM_DEBUG_KEYSTORE")
+                    ?: System.getenv("NEXUSTERM_ANDROID_TOOLCHAIN")?.let { "$it/debug.keystore" }
+                )?.let(::file)
+            if (persistent != null && persistent.exists()) {
+                storeFile = persistent
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -64,6 +87,10 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // HorizontalPager / gesture primitives behind the terminal tab switcher
+    // (ui/TerminalTabsPager.kt). Only reaches us transitively via material3
+    // otherwise, which would silently break if that dependency ever moved.
+    implementation("androidx.compose.foundation:foundation")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
@@ -103,6 +130,13 @@ dependencies {
 cargo {
     module = "../nexus-core"
     libname = "nexus_core"
+    // The plugin shells out to a Python linker wrapper and defaults to the
+    // command `python`, which doesn't exist on Debian 12+/13 (or in this
+    // container) — only `python3` does. Without this the Rust *compiles* and
+    // then dies at link time with "python: command not found", and only when
+    // nexus-core actually changed: an unchanged cached .so links nothing and
+    // hides the problem.
+    pythonCommand = "python3"
     // Matches gradle.properties' nexusterm.rustTargets, kept as literal ABI
     // names here because the rust-android-gradle plugin's `targets` DSL
     // expects its own ABI spelling (arm64/x86_64), not Rust triples.
@@ -118,6 +152,18 @@ cargo {
 // generator inspects the compiled .so's UniFFI metadata section).
 tasks.whenTaskAdded {
     if (name == "javaPreCompileDebug" || name == "javaPreCompileRelease") {
+        dependsOn("cargoBuild")
+    }
+    // `mergeXJniLibFolders` snapshots the jniLibs source dirs — one of which is
+    // the directory cargoBuild writes into. The plugin declares no relationship
+    // between the two, so without this the merge can snapshot *before* cargo has
+    // rebuilt, and the APK ships yesterday's libnexus_core.so next to today's
+    // UniFFI bindings. That mismatch doesn't fail the build: it crashes at
+    // runtime, either as "UniFFI API checksum mismatch" or — when only a record's
+    // fields changed — as a bare java.nio.BufferUnderflowException while
+    // decoding a return value. Both look like app bugs rather than stale output,
+    // which is exactly what makes it worth pinning down here.
+    if (name == "mergeDebugJniLibFolders" || name == "mergeReleaseJniLibFolders") {
         dependsOn("cargoBuild")
     }
 }
