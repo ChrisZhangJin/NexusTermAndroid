@@ -53,10 +53,17 @@ import uniffi.nexus_core.StoreException
 fun SessionListScreen(
     onAddNew: () -> Unit,
     onEdit: (SessionRecord) -> Unit,
+    /** Connects, or resumes the existing live session if there already is one. */
     onConnect: (SessionRecord) -> Unit,
+    /** Always dials a *new* connection, even when one is already live — a second tab onto the same host. */
+    onNewTab: (SessionRecord) -> Unit,
     onFiles: (SessionRecord) -> Unit,
     /** Caller is responsible for `SessionStore.delete` + clearing [com.nexusterm.android.ssh.SecretsStore]. */
     onDeleteRequested: suspend (SessionRecord) -> Unit,
+    /** Saved session ids that currently have a live (connected, not necessarily on-screen) SSH session — see MainActivity's `liveSessions`. Renders a small indicator so re-tapping "连接" is understood to resume rather than reconnect. */
+    connectedSessionIds: Set<String> = emptySet(),
+    /** Why the last connection attempt failed, if it did. Without this a failed dial is completely silent. */
+    connectError: String? = null,
 ) {
     var sessions by remember { mutableStateOf<List<SessionRecord>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
@@ -98,10 +105,22 @@ fun SessionListScreen(
                     Button(onClick = onAddNew, modifier = Modifier.padding(top = 12.dp)) { Text("新建连接") }
                 }
                 else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    if (connectError != null) {
+                        item {
+                            Text(
+                                text = connectError,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                            )
+                        }
+                    }
                     items(sessions, key = { it.id }) { session ->
                         SessionRow(
                             session = session,
+                            isConnected = session.id in connectedSessionIds,
                             onConnect = { onConnect(session) },
+                            onNewTab = { onNewTab(session) },
                             onFiles = { onFiles(session) },
                             onEdit = { onEdit(session) },
                             onDelete = {
@@ -122,13 +141,24 @@ fun SessionListScreen(
 @Composable
 private fun SessionRow(
     session: SessionRecord,
+    isConnected: Boolean,
     onConnect: () -> Unit,
+    onNewTab: () -> Unit,
     onFiles: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Text(text = session.name, style = MaterialTheme.typography.titleMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (isConnected) {
+                Text(
+                    text = "● ",
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+            Text(text = session.name, style = MaterialTheme.typography.titleMedium)
+        }
         Text(
             text = "${session.username}@${session.host}:${session.port}",
             style = MaterialTheme.typography.bodySmall,
@@ -141,7 +171,12 @@ private fun SessionRow(
             TextButton(onClick = onDelete) { Text("删除") }
             TextButton(onClick = onEdit) { Text("编辑") }
             TextButton(onClick = onFiles) { Text("文件") }
-            Button(onClick = onConnect) { Text("连接") }
+            // Only worth showing once there's something to be a *second* tab
+            // alongside — before that "连接" already opens the first one.
+            if (isConnected) {
+                TextButton(onClick = onNewTab) { Text("新标签") }
+            }
+            Button(onClick = onConnect) { Text(if (isConnected) "回到会话" else "连接") }
         }
     }
 }

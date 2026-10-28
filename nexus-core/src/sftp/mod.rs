@@ -1,21 +1,17 @@
-//! SFTP：从 NexusTerm 桌面版 `src-tauri/src/sftp/mod.rs` port 过来，但做了
-//! 两处刻意的改动（都在本模块注释里标出）：
+//! SFTP：从 NexusTerm 桌面版 `src-tauri/src/sftp/mod.rs` port 过来，行为与桌面版
+//! 一致（先复用终端连接、复用不成再独立拨号），只保留一处刻意的改动：
 //!
-//! 1. **不复用终端连接**。桌面版的 `SftpManager::connect` 会先尝试在同一配置下
-//!    已认证的终端连接上开一条 `sftp` 子系统通道，省掉对 OTP 服务器的二次验证。
-//!    这一期 Android 版本没有那张"已认证连接"登记表（见 `ssh::session::SharedConns`
-//!    从未在这里被引用），`sftp_connect` 永远独立拨号、独立认证——复用是后续
-//!    里程碑的工作（需要先把 `connect()` 的句柄也登记进一张共享表）。
-//! 2. **上传/下载不再用 `tokio::io::copy`**。原来一行 `io::copy(&mut src, &mut file)`
-//!    拿不到进度、也没法取消。这里换成一个显式的 64KB 分片循环，每片之后检查
-//!    取消标记、回调一次进度——`SftpProgressListener` 是本模块新增的
-//!    callback_interface，终端那条路径没有等价物。
+//! **上传/下载不再用 `tokio::io::copy`**。原来一行 `io::copy(&mut src, &mut file)`
+//! 拿不到进度、也没法取消。这里换成一个显式的 64KB 分片循环，每片之后检查
+//! 取消标记、回调一次进度——`SftpProgressListener` 是本模块新增的
+//! callback_interface，终端那条路径没有等价物。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
+use russh::client::Handle;
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,7 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::errors;
 use crate::listener::TerminalEventListener;
 use crate::ssh::session::{AuthContext, AuthMethod};
-use crate::ssh::{self, KnownHosts, LegacyPolicy, OpenError};
+use crate::ssh::{self, ClientHandler, KnownHosts, LegacyPolicy, OpenError};
 
 /// 单个远端目录项。与桌面版的 `RemoteEntry` 同构，字段名/形状不变——
 /// Kotlin 侧没有现成前端约定需要对齐，但保持同构方便将来对照桌面版排障。
@@ -44,6 +40,11 @@ pub struct SftpHandle {
     pub handle_id: String,
     /// 是否协商到了 SHA-1 系列的旧 KEX，语义同 `SessionHandle::legacy_crypto`。
     pub legacy_crypto: bool,
+    /// true = 这条 SFTP 会话长在某个终端标签已认证的连接上，没有重新握手/认证。
+    ///
+    /// 报给 Kotlin 是因为本模块的 `tracing::info!` 在 Android 上没有 subscriber，
+    /// 日志哪儿也去不了；复用与否只能靠返回值说话，否则这个优化从外面完全不可观测。
+    pub reused: bool,
 }
 
 /// SFTP 操作的错误类型。与 `SessionError`（`SshError`）同构：内容已是完整的
@@ -82,13 +83,55 @@ pub trait SftpProgressListener: Send + Sync {
 /// guard 不是 `Send`，没法跨 await point 持有。
 struct Registry {
     sessions: AsyncMutex<HashMap<String, SftpSession>>,
+    /// 只有复用了终端连接的 SFTP 会话才有条目。
+    ///
+    /// 终端标签关掉后 `SessionRuntime` 里的 `Arc<Handle>` 会被释放；若文件面板
+    /// 还开着，连接就会被连带回收，传输到一半直接断。句柄在这里多拿一份引用
+    /// 保活，直到 SFTP 会话自己 `close`。
+    held: StdMutex<HashMap<String, Arc<Handle<ClientHandler>>>>,
 }
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Registry {
         sessions: AsyncMutex::new(HashMap::new()),
+        held: StdMutex::new(HashMap::new()),
     })
+}
+
+/// 复用一条已认证连接时可能出的两种岔子——区别在于「该不该回退到独立拨号」。
+enum ReuseError {
+    /// 连接层面的问题（那条连接正好断了）。独立拨一条就能解决。
+    Connection(String),
+    /// 服务器根本没开 sftp 子系统。独立拨号也是一样的结果，别白跑一次认证。
+    Subsystem(SftpError),
+}
+
+/// 在一条已认证的终端连接上开 `sftp` 子系统通道。
+async fn open_shared(id: &str, handle: Arc<Handle<ClientHandler>>) -> Result<(), ReuseError> {
+    // 通道开不出来只可能是连接层面的问题，退回独立连接是对的。
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| ReuseError::Connection(e.to_string()))?;
+
+    if let Err(e) = channel.request_subsystem(true, "sftp").await {
+        // 通道已经开了，用不上就还回去，别在服务端留个半开通道。
+        let _ = channel.close().await;
+        return Err(ReuseError::Subsystem(SftpError::Subsystem(e.to_string())));
+    }
+
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| ReuseError::Subsystem(SftpError::Subsystem(e.to_string())))?;
+
+    registry().sessions.lock().await.insert(id.to_string(), sftp);
+    registry()
+        .held
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), handle);
+    Ok(())
 }
 
 /// 进行中传输的取消标记登记表：transfer_id → 共享的取消旗标。
@@ -127,13 +170,18 @@ fn map_open_err(host: &str, port: u16, timeout: Duration, e: OpenError) -> SftpE
     }
 }
 
-/// 独立拨号 + 认证，再在同一条连接上开 `sftp` 子系统。
+/// 开一条 SFTP 会话：先试着复用同配置下已认证的终端连接，复用不成再独立拨号。
 ///
-/// 不复用任何既有终端连接（见模块顶部说明①），`listener` 仅用于二次验证/私钥
-/// 口令问询——SFTP 操作本身没有"终端输出"这个概念，`on_data`/`on_pulse` 不会
-/// 被这条路径触发。
+/// 复用省掉整个握手 + 认证过程，对 OTP 服务器尤其重要——否则用户每打开一次文件
+/// 面板就要再输一次验证码。`config_id` 是保存的会话 id（`SessionRecord::id`），
+/// 由它把这条请求和 `connect()` 登记进 [`ssh::session::SharedConns`] 的终端连接
+/// 对上号。
+///
+/// `listener` 仅用于二次验证/私钥口令问询——SFTP 操作本身没有"终端输出"这个
+/// 概念，`on_data`/`on_pulse` 不会被这条路径触发。
 #[uniffi::export]
 pub fn sftp_connect(
+    config_id: String,
     host: String,
     port: u16,
     username: String,
@@ -143,6 +191,47 @@ pub fn sftp_connect(
     let listener: Arc<dyn TerminalEventListener> = Arc::from(listener);
     let id = new_handle_id();
     let timeout = errors::resolve_timeout(None);
+
+    // 复用路径。四个条件缺一不可：同一配置、同一主机端口、同一用户、连接还活着。
+    // 少掉主机校验的话，配置从 A 改成 B 之后旧标签仍连着 A，文件面板会悄悄列出
+    // A 的目录，而用户以为自己在看 B。
+    let alive = crate::manager()
+        .shared()
+        .lock()
+        .values()
+        .find(|c| {
+            c.config_id == config_id
+                && c.host == host
+                && c.port == port
+                && c.username == username
+                && !c.handle.is_closed()
+        })
+        .map(|c| c.handle.clone());
+
+    if let Some(handle) = alive {
+        match crate::runtime().block_on(open_shared(&id, handle)) {
+            Ok(()) => {
+                tracing::info!(session = %id, config = %config_id, "SFTP 复用已认证连接");
+                return Ok(SftpHandle {
+                    handle_id: id,
+                    // 复用的是终端那条连接，算法协商结果归它所有；这里没有重新
+                    // 握手，无从判断，按不降级上报。
+                    legacy_crypto: false,
+                    reused: true,
+                });
+            }
+            // 连接正好断了：当成没复用，老老实实自己连。
+            Err(ReuseError::Connection(e)) => {
+                tracing::info!(
+                    session = %id,
+                    config = %config_id,
+                    "复用连接不可用，回退独立连接：{e}"
+                );
+            }
+            // 服务器不给 sftp 子系统，独立连接也一样，别白跑一次认证。
+            Err(ReuseError::Subsystem(e)) => return Err(e),
+        }
+    }
     let known_hosts = Arc::new(KnownHosts::new());
     let prompts = Arc::new(ssh::prompt::AuthPrompts::new());
 
@@ -188,6 +277,7 @@ pub fn sftp_connect(
     Ok(SftpHandle {
         handle_id: id,
         legacy_crypto,
+        reused: false,
     })
 }
 
@@ -542,6 +632,9 @@ pub fn sftp_close(handle_id: String) -> Result<(), SftpError> {
         if let Some(s) = registry().sessions.lock().await.remove(&handle_id) {
             let _ = s.close().await;
         }
+        // 释放保活引用。复用的那条连接属于终端标签，什么时候关由它自己决定——
+        // 这里只负责别让文件面板替它续命。
+        registry().held.lock().unwrap().remove(&handle_id);
         Ok(())
     })
 }

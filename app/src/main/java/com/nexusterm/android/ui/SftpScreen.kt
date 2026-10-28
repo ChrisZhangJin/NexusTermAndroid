@@ -2,6 +2,8 @@ package com.nexusterm.android.ui
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -92,7 +94,14 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
     var session by remember { mutableStateOf<SessionRecord?>(null) }
     var handleId by remember { mutableStateOf<String?>(null) }
     var connecting by remember { mutableStateOf(true) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    // Split in two on purpose: a dead SSH connection must only disable the
+    // "远程" pane. The single `errorMessage` this replaced was checked ahead of
+    // the side switch, so any remote failure (and the whole connecting phase)
+    // also swallowed the "本地" pane — the folder picker was unreachable
+    // whenever the host was down, which read as "local browsing is broken".
+    var connectError by remember { mutableStateOf<String?>(null) }
+    var notice by remember { mutableStateOf<String?>(null) }
 
     var side by remember { mutableStateOf(SftpSide.REMOTE) }
 
@@ -106,18 +115,40 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
 
     var transfer by remember { mutableStateOf<TransferProgress?>(null) }
 
+    fun openLocalRoot(uri: Uri): Boolean {
+        val root = runCatching { DocumentFile.fromTreeUri(context, uri) }.getOrNull()
+        if (root == null || !root.isDirectory) return false
+        localStack = listOf(root)
+        localEntries = root.listFiles().toList()
+        selectedLocal = null
+        return true
+    }
+
     val openTree = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
-            context.contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
-            val root = DocumentFile.fromTreeUri(context, uri)
-            if (root != null) {
-                localStack = listOf(root)
-                localEntries = root.listFiles().toList()
-                selectedLocal = null
+            // MIUI's picker has been observed to return a tree it then refuses to
+            // persist; the grant is still valid for this process, so a failure
+            // here only costs us the "remember it next time" part.
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
             }
+            if (!openLocalRoot(uri)) notice = "无法打开所选文件夹，请换一个试试"
+        }
+    }
+
+    // Re-adopt a folder granted in an earlier run so the user isn't sent back
+    // through the system picker on every visit. Grants accumulate and come back
+    // in no useful order, so take the newest — that's the one "更换文件夹" just
+    // picked, not some long-abandoned root.
+    LaunchedEffect(Unit) {
+        if (localStack.isEmpty()) {
+            context.contentResolver.persistedUriPermissions
+                .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) }
+                .maxByOrNull { it.persistedTime }
+                ?.let { openLocalRoot(it.uri) }
         }
     }
 
@@ -133,18 +164,18 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                 remotePath = path
                 selectedRemote = null
             } catch (e: SftpException) {
-                errorMessage = e.message ?: "列目录失败"
+                notice = e.message ?: "列目录失败"
             }
         }
     }
 
     LaunchedEffect(sessionId) {
         connecting = true
-        errorMessage = null
+        connectError = null
         try {
             val record = SessionStore.list().firstOrNull { it.id == sessionId }
             if (record == null) {
-                errorMessage = "会话不存在"
+                connectError = "会话不存在"
                 return@LaunchedEffect
             }
             session = record
@@ -155,15 +186,30 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                 onClosedCallback = { _, _ -> },
                 onAuthPromptCallback = { "" },
             )
-            val handle = SftpClient.connect(record.host, record.port.toInt(), record.username, auth, listener)
+            val handle = SftpClient.connect(
+                configId = sessionId,
+                host = record.host,
+                port = record.port.toInt(),
+                username = record.username,
+                auth = auth,
+                listener = listener,
+            )
             handleId = handle.handleId
+            android.util.Log.d(
+                "NexusTermSftp",
+                if (handle.reused) {
+                    "reused the terminal's authenticated connection (no second handshake/auth)"
+                } else {
+                    "dialled an independent connection (no live terminal for this session)"
+                },
+            )
             val home = SftpClient.home(handle.handleId)
             remotePath = home
             remoteEntries = SftpClient.list(handle.handleId, home)
         } catch (e: SftpException) {
-            errorMessage = e.message ?: "连接失败"
+            connectError = e.message ?: "连接失败"
         } catch (e: StoreException) {
-            errorMessage = e.message ?: "无法读取会话配置"
+            connectError = e.message ?: "无法读取会话配置"
         } finally {
             connecting = false
         }
@@ -194,18 +240,29 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                 Tab(selected = side == SftpSide.REMOTE, onClick = { side = SftpSide.REMOTE }, text = { Text("远程") })
             }
 
-            when {
-                connecting -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
+            notice?.let { message ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { notice = null }) { Text("知道了") }
                 }
-                errorMessage != null -> Text(
-                    text = errorMessage ?: "",
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(16.dp),
-                )
-                side == SftpSide.LOCAL -> LocalPane(
+            }
+
+            when (side) {
+                SftpSide.LOCAL -> LocalPane(
                     rootChosen = localStack.isNotEmpty(),
                     canGoUp = localStack.size > 1,
+                    folderPath = localStack.takeIf { it.isNotEmpty() }?.let { stack ->
+                        (listOf(localRootLabel(stack.first())) + stack.drop(1).map { it.name ?: "?" })
+                            .joinToString(" / ")
+                    },
                     entries = localEntries,
                     selected = selectedLocal,
                     onChooseRoot = { openTree.launch(null) },
@@ -223,7 +280,7 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                     onUpload = { src ->
                         val hid = handleId
                         if (hid == null) {
-                            errorMessage = "尚未连接"
+                            notice = connectError ?: "尚未连接到远程主机"
                         } else {
                             val dest = joinRemotePath(remotePath, src.name ?: "file")
                             scope.launch {
@@ -232,39 +289,49 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                         }
                     },
                 )
-                else -> RemotePane(
-                    path = remotePath,
-                    entries = remoteEntries,
-                    selected = selectedRemote,
-                    onGoUp = {
-                        val parent = remotePath.substringBeforeLast('/').ifEmpty { "/" }
-                        refreshRemote(parent)
-                    },
-                    onOpenDir = { refreshRemote(it.path) },
-                    onSelectFile = { selectedRemote = it },
-                    onDownload = { entry ->
-                        val hid = handleId
-                        val destDir = localStack.lastOrNull()
-                        when {
-                            hid == null -> errorMessage = "尚未连接"
-                            destDir == null -> errorMessage = "请先在「本地」标签选择一个文件夹"
-                            else -> scope.launch {
-                                downloadViaTempFile(context, hid, entry, destDir) { transfer = it }
+                SftpSide.REMOTE -> when {
+                    connecting -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                    connectError != null -> Text(
+                        text = connectError ?: "",
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                    else -> RemotePane(
+                        path = remotePath,
+                        entries = remoteEntries,
+                        selected = selectedRemote,
+                        onGoUp = {
+                            val parent = remotePath.substringBeforeLast('/').ifEmpty { "/" }
+                            refreshRemote(parent)
+                        },
+                        onOpenDir = { refreshRemote(it.path) },
+                        onSelectFile = { selectedRemote = it },
+                        onDownload = { entry ->
+                            val hid = handleId
+                            val destDir = localStack.lastOrNull()
+                            when {
+                                hid == null -> notice = "尚未连接到远程主机"
+                                destDir == null -> notice = "请先在「本地」标签选择一个文件夹"
+                                else -> scope.launch {
+                                    downloadViaTempFile(context, hid, entry, destDir) { transfer = it }
+                                }
                             }
-                        }
-                    },
-                    onDelete = { entry ->
-                        val hid = handleId ?: return@RemotePane
-                        scope.launch {
-                            try {
-                                SftpClient.remove(hid, entry.path)
-                                refreshRemote(remotePath)
-                            } catch (e: SftpException) {
-                                errorMessage = e.message ?: "删除失败"
+                        },
+                        onDelete = { entry ->
+                            val hid = handleId ?: return@RemotePane
+                            scope.launch {
+                                try {
+                                    SftpClient.remove(hid, entry.path)
+                                    refreshRemote(remotePath)
+                                } catch (e: SftpException) {
+                                    notice = e.message ?: "删除失败"
+                                }
                             }
-                        }
-                    },
-                )
+                        },
+                    )
+                }
             }
         }
     }
@@ -310,6 +377,7 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
 private fun LocalPane(
     rootChosen: Boolean,
     canGoUp: Boolean,
+    folderPath: String?,
     entries: List<DocumentFile>,
     selected: DocumentFile?,
     onChooseRoot: () -> Unit,
@@ -319,14 +387,45 @@ private fun LocalPane(
     onUpload: (DocumentFile) -> Unit,
 ) {
     if (!rootChosen) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Button(onClick = onChooseRoot) { Text("选择本地文件夹") }
+        Column(
+            modifier = Modifier.fillMaxSize().padding(32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = "Android 不允许应用直接访问手机存储，需要你先挑一个文件夹授权给 NexusTerm。" +
+                    "选「内部存储」或某张 SD 卡的根目录，就能浏览它下面的全部内容。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = onChooseRoot, modifier = Modifier.padding(top = 16.dp)) {
+                Text("选择本地文件夹")
+            }
         }
         return
     }
     Column(Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = folderPath ?: "",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onChooseRoot) { Text("更换文件夹") }
+        }
         if (canGoUp) {
             TextButton(onClick = onGoUp) { Text("上一级") }
+        }
+        if (entries.isEmpty()) {
+            Text(
+                text = "（空文件夹）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(16.dp),
+            )
         }
         LazyColumn(modifier = Modifier.weight(1f)) {
             items(entries, key = { it.uri.toString() }) { doc ->
@@ -398,6 +497,22 @@ private fun RemotePane(
                 TextButton(onClick = { onDelete(selected) }) { Text("删除") }
             }
         }
+    }
+}
+
+/**
+ * [DocumentFile.getName] on a tree root is the provider's leaf display name,
+ * which for primary storage is the literal "0" (from `/storage/emulated/0`).
+ * Label the root by its storage volume instead.
+ */
+private fun localRootLabel(root: DocumentFile): String {
+    val volume = runCatching {
+        DocumentsContract.getTreeDocumentId(root.uri).substringBefore(':')
+    }.getOrNull()
+    return when {
+        volume == "primary" -> "内部存储"
+        !volume.isNullOrEmpty() -> volume
+        else -> root.name ?: "本地"
     }
 }
 

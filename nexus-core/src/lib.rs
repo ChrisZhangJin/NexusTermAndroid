@@ -34,7 +34,7 @@ pub struct SessionHandle {
 /// 登记表。桌面版里这个单例由 Tauri 的 `AppState` 托管；Android 没有等价
 /// 机制，这里用 `OnceLock` 自己管生命周期——对一个长驻的 Application 进程
 /// 而言语义是一样的（进程死连接也必然死）。
-fn manager() -> &'static ssh::session::SessionManager {
+pub(crate) fn manager() -> &'static ssh::session::SessionManager {
     static MANAGER: OnceLock<ssh::session::SessionManager> = OnceLock::new();
     MANAGER.get_or_init(ssh::session::SessionManager::new)
 }
@@ -154,8 +154,13 @@ pub fn delete_session(id: String) -> Result<(), StoreError> {
 /// 真正的握手、算法协商、二次验证（keyboard-interactive）、pty/shell 请求
 /// 全部原样保留在 `ssh::session::SessionManager::connect` 里，这里只是把
 /// UniFFI 的参数形状适配过去，并把读写循环丢进专属 runtime。
+/// `config_id` 是保存的会话 id（`SessionRecord::id`）。登记进
+/// [`ssh::session::SharedConns`] 之后，同一配置的文件面板就能复用这条已认证连接
+/// 开 sftp 子系统，省掉一次握手和一次验证码——没有它，`sftp_connect` 永远只能
+/// 独立拨号。
 #[uniffi::export]
 pub fn connect(
+    config_id: String,
     host: String,
     port: u16,
     username: String,
@@ -173,7 +178,7 @@ pub fn connect(
         rows: 32,
         connect_timeout_secs: None,
         legacy_crypto: None,
-        config_id: None,
+        config_id: Some(config_id),
         sidecar: Some(false),
     };
 

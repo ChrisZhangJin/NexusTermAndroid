@@ -43,14 +43,21 @@ object SftpClient {
      *   already translates russh's raw errors into Chinese human-readable
      *   text (see nexus-core/src/errors.rs).
      */
+    /**
+     * @param configId the saved session id. If a terminal tab for the same
+     *   config/host/port/user is still connected, nexus-core opens the sftp
+     *   subsystem on *that* connection — no second handshake, and no second
+     *   one-time password. Falls back to dialling independently otherwise.
+     */
     suspend fun connect(
+        configId: String,
         host: String,
         port: Int,
         username: String,
         auth: AuthMethod,
         listener: TerminalEventListener,
     ): SftpHandle = withContext(Dispatchers.IO) {
-        uniffiSftpConnect(host, port.toUShort(), username, auth, listener)
+        uniffiSftpConnect(configId, host, port.toUShort(), username, auth, listener)
     }
 
     suspend fun list(handleId: String, path: String): List<RemoteEntry> = withContext(Dispatchers.IO) {

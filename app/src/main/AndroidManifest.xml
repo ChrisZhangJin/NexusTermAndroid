@@ -2,6 +2,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      Required by ConnectivityManager.registerDefaultNetworkCallback, which is
+      how auto-reconnect notices the network came back (see MainActivity's
+      `networkCallback`). Without it the call throws SecurityException and the
+      retry loop falls back to waiting out its backoff — so a session would sit
+      there dead for up to 30s after wifi returns. It's a normal permission, so
+      it's granted at install with no runtime prompt.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:name=".NexusTermApplication"
@@ -11,10 +20,27 @@
         android:theme="@style/Theme.NexusTermAndroid"
         android:usesCleartextTraffic="false">
 
+        <!--
+          windowSoftInputMode: left unset, the system picked ADJUST_PAN for
+          this window — it slid the whole thing up behind the IME instead of
+          shrinking it, and the extra-keys row (ui/TerminalKeyBar.kt), anchored
+          to the bottom of the window, went with it and ended up underneath the
+          keyboard. Those keys exist to be pressed *while* typing, so they have
+          to sit above the IME the way Termux's do.
+
+          ADJUST_RESIZE is also the honest answer for a terminal: the visible
+          shell really is shorter while the keyboard is up, and shrinking the
+          window is what lets index.html's fit() report the true rows to the
+          remote pty. Deliberately *not* paired with edge-to-edge
+          (setDecorFitsSystemWindows(false)): that would replace the resize
+          with IME insets, which this app's minSdk-26 floor can't rely on —
+          WindowInsets.ime is only populated from API 30.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.NexusTermAndroid">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

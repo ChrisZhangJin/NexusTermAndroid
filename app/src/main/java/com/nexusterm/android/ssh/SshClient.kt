@@ -35,14 +35,21 @@ object SshClient {
      *   already translates russh's raw errors into Chinese human-readable
      *   text, see nexus-core/src/errors.rs).
      */
+    /**
+     * @param configId the saved [uniffi.nexus_core.SessionRecord] id this dial
+     *   came from. nexus-core registers the authenticated connection under it,
+     *   which is what lets [SftpClient.connect] borrow this connection instead
+     *   of handshaking and authenticating all over again.
+     */
     suspend fun connect(
+        configId: String,
         host: String,
         port: Int,
         username: String,
         auth: AuthMethod,
         listener: TerminalEventListener,
     ): SessionHandle = withContext(Dispatchers.IO) {
-        uniffiConnect(host, port.toUShort(), username, auth, listener)
+        uniffiConnect(configId, host, port.toUShort(), username, auth, listener)
     }
 
     suspend fun write(sessionId: String, bytes: ByteArray) = withContext(Dispatchers.IO) {

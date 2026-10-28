@@ -7,6 +7,11 @@
   ui/TerminalScreen.kt):
     Kotlin -> JS:  webView.evaluateJavascript("window.NexusTerm.writeBase64('...')", null)
                    webView.evaluateJavascript("window.NexusTerm.notifyClosed('reason')", null)
+                   ...plus sendKeyBase64 / setModifiers / uiState, used by the
+                   extra-keys row in ui/TerminalKeyBar.kt. `uiState` is *read*
+                   through evaluateJavascript's result callback: NexusAndroid
+                   can't grow new methods without touching TerminalScreen.kt,
+                   so pulling is the only way those facts reach Kotlin.
     JS -> Kotlin:  window.NexusAndroid.onTermInput(utf8OrBase64String)   // keystrokes
                    window.NexusAndroid.onResize(cols, rows)              // on fit()
   `NexusAndroid` is the addJavascriptInterface() object registered by
@@ -43,14 +48,61 @@
   term.open(document.getElementById("terminal"));
   fitAddon.fit();
 
+  // ---- Sticky Ctrl/Alt ----
+  // The extra-keys row (ui/TerminalKeyBar.kt) arms these with a tap and the
+  // *next* keystroke spends them, Termux-style. That next keystroke is just as
+  // likely to come from the soft keyboard, which reaches us through
+  // term.onData and never passes through Kotlin at all -- so the armed flags
+  // live here, the one place both input sources meet. Kotlin only mirrors them
+  // for painting; a second copy of this logic on that side would have to stay
+  // in step across an async bridge, and the window where it didn't is exactly
+  // the window where Ctrl+C gets dropped or sent twice.
+  var ctrlArmed = false;
+  var altArmed = false;
+
+  /** Ctrl+<key> as its VT control code, or null when there isn't one. */
+  function controlCode(ch) {
+    var c = ch.charCodeAt(0);
+    if (c >= 0x61 && c <= 0x7a) return c - 0x60; // a-z
+    if (c >= 0x41 && c <= 0x5a) return c - 0x40; // A-Z, same codes
+    if (c >= 0x5b && c <= 0x5f) return c - 0x40; // [ \ ] ^ _
+    if (ch === " ") return 0x00;                 // Ctrl+Space -> NUL
+    if (ch === "?") return 0x7f;                 // Ctrl+? -> DEL
+    return null;
+  }
+
+  // Only the first character is modified: a paste, an IME commit or an
+  // autocorrect replacement all arrive as one multi-character payload, and
+  // Ctrl is meant to bind to a keystroke rather than to a whole burst.
+  // Anything with no control code (Ctrl+F5 and friends) is sent through
+  // unmodified -- better than mangling it -- but still spends the modifier,
+  // so an armed Ctrl can never leak into a later keystroke.
+  function applyModifiers(data) {
+    if (!data || (!ctrlArmed && !altArmed)) return data;
+    var head = data.charAt(0);
+    var tail = data.slice(1);
+    if (ctrlArmed) {
+      var code = controlCode(head);
+      if (code !== null) head = String.fromCharCode(code);
+    }
+    if (altArmed) head = "\x1b" + head;
+    ctrlArmed = false;
+    altArmed = false;
+    return head + tail;
+  }
+
   // Keystrokes / pasted text -> Kotlin. We send raw strings (xterm already
   // gives us UTF-16 JS strings); Kotlin re-encodes to UTF-8 bytes before
   // handing them to nexus-core's write(). This mirrors the desktop app's
   // "whatever xterm emits, forward untouched" behaviour for key handling.
-  term.onData(function (data) {
+  function sendInput(data) {
     if (window.NexusAndroid && window.NexusAndroid.onTermInput) {
       window.NexusAndroid.onTermInput(data);
     }
+  }
+
+  term.onData(function (data) {
+    sendInput(applyModifiers(data));
   });
 
   function reportSize() {
@@ -98,6 +150,41 @@
     fit: function () {
       fitAddon.fit();
       reportSize();
+    },
+
+    /**
+     * A key tapped on the extra-keys row. The payload is base64 for the same
+     * reason writeBase64's is: it carries escape sequences, and base64's
+     * alphabet needs no escaping when Kotlin splices it into a JS string
+     * literal. Every payload the bar sends is ASCII, so atob() reproduces it
+     * exactly.
+     *
+     * Routed back out through the same sendInput() the soft keyboard uses
+     * rather than written to the session from Kotlin, so both input sources
+     * share one armed-modifier state and can't race each other.
+     */
+    sendKeyBase64: function (b64) {
+      sendInput(applyModifiers(atob(b64)));
+    },
+
+    setModifiers: function (ctrl, alt) {
+      ctrlArmed = !!ctrl;
+      altArmed = !!alt;
+    },
+
+    /**
+     * Everything the key bar needs to paint itself, as "<atBottom><ctrl><alt>"
+     * in 0/1. Polled by Kotlin through evaluateJavascript's result callback:
+     * `window.NexusAndroid` is built in ui/TerminalScreen.kt and can't grow an
+     * event for "the user scrolled into the scrollback" or "the armed Ctrl was
+     * just spent", so a pull is the only channel available. Three characters
+     * keeps the poll cheap and spares the Kotlin side a JSON parse.
+     */
+    uiState: function () {
+      var buf = term.buffer.active;
+      return (buf.viewportY >= buf.baseY ? "1" : "0") +
+        (ctrlArmed ? "1" : "0") +
+        (altArmed ? "1" : "0");
     },
   };
 })();
