@@ -12,6 +12,18 @@
     -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!--
+      SessionService: keeps the process (and so every live SSH session) from
+      being reclaimed while the app is in the background. specialUse because
+      none of the typed FGS categories (dataSync, connectedDevice, …) honestly
+      describe an interactive remote shell. POST_NOTIFICATIONS is a runtime
+      permission on API 33+; if it's denied the service still runs, its
+      notification just isn't shown.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".NexusTermApplication"
         android:allowBackup="true"
@@ -47,6 +59,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".SessionService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps user-initiated SSH terminal sessions connected while the app is in the background" />
+        </service>
     </application>
 
 </manifest>

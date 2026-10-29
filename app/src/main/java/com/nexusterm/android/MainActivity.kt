@@ -1,11 +1,16 @@
 package com.nexusterm.android
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -38,11 +43,13 @@ import com.nexusterm.android.ui.TerminalHandle
 import com.nexusterm.android.ui.TerminalTab
 import com.nexusterm.android.ui.TerminalTabsPager
 import com.nexusterm.android.ui.createTerminal
+import com.nexusterm.android.ui.theme.NexusTermTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -363,6 +370,45 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // Android 13+ hides every notification — the foreground service's
+            // included — until this is granted. Not acted on either way: a
+            // denial only hides the session count, the service still runs and
+            // still keeps the sessions alive in the background.
+            val notificationPermission = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission(),
+            ) { granted -> Log.d(TAG, "POST_NOTIFICATIONS granted=$granted") }
+
+            // Mirrors the live (non-CLOSED) tabs into SessionService. CLOSED
+            // tabs are left out on purpose: a tab whose retry ladder gave up
+            // is dead weight the user still has to close, not a session worth
+            // holding the process up for. Titles are part of the key so the
+            // "（重连中 3/10）" suffix ticks along in the notification too.
+            LaunchedEffect(Unit) {
+                var askedPermission = false
+                snapshotFlow {
+                    liveSessions.filter { it.state != LinkState.CLOSED }.map { it.state to it.tabTitle }
+                }.distinctUntilChanged().collect { live ->
+                    if (live.isEmpty()) {
+                        SessionService.stop(this@MainActivity)
+                        return@collect
+                    }
+                    SessionService.update(
+                        context = this@MainActivity,
+                        titles = live.map { it.second },
+                        reconnecting = live.count { it.first == LinkState.RECONNECTING },
+                    )
+                    // Asked on the first connect rather than at launch, so the
+                    // prompt shows up with an obvious reason attached.
+                    if (!askedPermission &&
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        askedPermission = true
+                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+            }
+
             // One retry loop per live session, owned by the composition rather
             // than by `lifecycleScope`: Compose disposes it the moment the
             // session leaves `liveSessions`, so closing a tab cancels its
@@ -384,7 +430,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            MaterialTheme {
+            NexusTermTheme {
                 Surface(modifier = Modifier, color = MaterialTheme.colorScheme.background) {
                     NavHost(navController = navController, startDestination = "sessionList") {
                         composable("sessionList") {
@@ -477,6 +523,11 @@ class MainActivity : ComponentActivity() {
                                     onCloseTab = { id ->
                                         liveSessions.firstOrNull { it.tabId == id }
                                             ?.let(::disconnectLive)
+                                    },
+                                    onOpenSftp = { id ->
+                                        liveSessions.firstOrNull { it.tabId == id }?.let {
+                                            navController.navigate("sftp/${it.savedSessionId}")
+                                        }
                                     },
                                 )
                             }
@@ -662,6 +713,13 @@ class MainActivity : ComponentActivity() {
                 getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(callback)
             }
         }
+        // `liveSessions` lives in this activity's composition, so once the
+        // activity is finishing nothing can ever reattach to those tabs —
+        // keeping the process pinned in the foreground for them would just be
+        // a notification lying about sessions the user can't reach. (Not
+        // done for a config-change recreate: the new composition's first
+        // emission handles that case itself.)
+        if (isFinishing) SessionService.stop(this)
         super.onDestroy()
     }
 
