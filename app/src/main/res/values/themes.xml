@@ -1,3 +1,8 @@
 <resources>
-    <style name="Theme.NexusTermAndroid" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.NexusTermAndroid" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">@color/nexus_green</item>
+        <item name="android:colorPrimaryDark">@color/nexus_green_dark</item>
+        <item name="android:colorAccent">@color/nexus_green_light</item>
+        <item name="android:statusBarColor">@color/nexus_green_dark</item>
+    </style>
 </resources>

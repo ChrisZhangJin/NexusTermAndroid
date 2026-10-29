@@ -1,12 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Derived from NexusTerm/icon-design/icon.svg (1024x1024). Scaled 0.68 about the
+     centre so the artwork sits inside the adaptive-icon safe zone (66dp of 108dp). -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="#4CD3A5"
-        android:pathData="M24,30 L54,54 L24,78 L24,66 L40,54 L24,42 Z" />
-    <path
-        android:fillColor="#4CD3A5"
-        android:pathData="M58,72 L84,72 L84,82 L58,82 Z" />
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+    <group
+        android:pivotX="512"
+        android:pivotY="512"
+        android:scaleX="0.68"
+        android:scaleY="0.68">
+        <path
+            android:fillColor="#0F2A23"
+            android:pathData="M280,261 L856,261 L744,763 L168,763 Z" />
+        <path
+            android:pathData="M401,405 L567,520 L401,635"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="68"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M583,635 L675,635"
+            android:strokeColor="#FFFFFF"
+            android:strokeWidth="68"
+            android:strokeLineCap="round" />
+    </group>
 </vector>
