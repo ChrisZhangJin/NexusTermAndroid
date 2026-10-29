@@ -18,8 +18,42 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 
 private const val TAG = "NexusTermUI"
+
+/** Font size bounds for pinch-to-zoom, in CSS px (= dp in the WebView). */
+const val MIN_FONT_SIZE = 8
+const val MAX_FONT_SIZE = 28
+const val DEFAULT_FONT_SIZE = 14
+
+/**
+ * Width of the virtual window. 160 columns is about 3.3 screens of a portrait
+ * phone at 14px — wide enough for `top`, `ps aux` and most log lines without
+ * wrapping, yet still a short swipe from one edge to the other.
+ */
+const val VIRTUAL_WINDOW_COLS = 160
+
+/**
+ * The one terminal setting that outlives the app: the font size last pinched
+ * to. Global rather than per saved session — it's about the phone and the
+ * user's eyes, not about the host — and only read when a terminal is
+ * created, so tabs that are already open keep whatever they were zoomed to.
+ */
+internal object TerminalPrefs {
+    private const val FILE = "terminal"
+    private const val KEY_FONT_SIZE = "font_size"
+
+    fun fontSize(context: Context): Int =
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .getInt(KEY_FONT_SIZE, DEFAULT_FONT_SIZE)
+            .coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+
+    fun setFontSize(context: Context, px: Int) {
+        context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+            .edit().putInt(KEY_FONT_SIZE, px).apply()
+    }
+}
 
 /**
  * Hosts a WebView running the xterm.js bundle in
@@ -37,7 +71,18 @@ private const val TAG = "NexusTermUI"
  * hatch the caller (MainActivity) uses to push bytes in without having to
  * reach into WebView internals.
  */
-class TerminalHandle internal constructor(internal val webView: WebView) {
+class TerminalHandle internal constructor(
+    internal val webView: WebView,
+    fontSize: Int,
+) {
+    /** Font size this terminal is showing, in CSS px. */
+    var fontSize: Int = fontSize
+        private set
+
+    /** Whether this tab is in the [VIRTUAL_WINDOW_COLS]-wide virtual window. Not persisted. */
+    var virtualWindow: Boolean = false
+        private set
+
     // `window.NexusTerm` only exists once index.html's inline <script> has
     // actually run — which is strictly after onPageFinished, not right
     // after loadUrl() returns. Any bytes arriving before that (very likely,
@@ -112,6 +157,63 @@ class TerminalHandle internal constructor(internal val webView: WebView) {
     }
 
     /**
+     * Changes the font size, clamped to [MIN_FONT_SIZE]..[MAX_FONT_SIZE].
+     * With [commit] false the terminal only reflows locally (a pinch in
+     * progress); true also reports the new cols/rows to the remote pty and
+     * remembers the size for future terminals. [focusX] is the pinch centre
+     * in page px, which the virtual window keeps anchored.
+     */
+    fun setFontSize(px: Int, commit: Boolean, focusX: Float = 0f) {
+        fontSize = px.coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        webView.evaluateJavascript(
+            "window.NexusTerm && window.NexusTerm.setFontSize($fontSize, $commit, $focusX);",
+            null,
+        )
+        if (commit) TerminalPrefs.setFontSize(webView.context, fontSize)
+    }
+
+    fun setVirtualWindow(on: Boolean) {
+        virtualWindow = on
+        val cols = if (on) VIRTUAL_WINDOW_COLS else 0
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.setVirtualCols($cols);", null)
+    }
+
+    fun paste(text: String) {
+        val b64 = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.pasteBase64('$b64');", null)
+    }
+
+    fun clearScreen() {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.clearScreen();", null)
+    }
+
+    fun scrollToBottom() {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.scrollToBottom();", null)
+    }
+
+    /**
+     * Touch selection: [selectBegin] selects the word at the point, [selectMove]
+     * stretches it out to another. Coordinates are page px, i.e. dp from the
+     * WebView's top-left.
+     */
+    fun selectBegin(x: Float, y: Float) {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.selectBegin($x, $y);", null)
+    }
+
+    fun selectMove(x: Float, y: Float) {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.selectMove($x, $y);", null)
+    }
+
+    /** Ends the selection and hands back its text ("" when nothing was selected). */
+    fun selectEnd(onText: (String) -> Unit) {
+        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.selectEnd() : ''") { raw ->
+            // The result arrives JSON-encoded: a quoted, escaped string literal.
+            val text = runCatching { JSONArray("[$raw]").optString(0, "") }.getOrDefault("")
+            onText(if (raw == "null") "" else text)
+        }
+    }
+
+    /**
      * Tears the terminal down for good. Detaches before destroying: a
      * WebView destroyed while still attached to a window logs a hard error
      * and can take the process down, and the Composable showing it is only
@@ -142,6 +244,7 @@ fun createTerminal(
     onInput: (String) -> Unit,
     onResize: (cols: Int, rows: Int) -> Unit,
 ): TerminalHandle {
+    val startFontSize = TerminalPrefs.fontSize(context)
     val webView = WebView(context).apply {
         // Without explicit layoutParams, a WebView attached by an
         // AndroidView can end up measured at a near-zero height — Blink's
@@ -157,6 +260,12 @@ fun createTerminal(
         )
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
+        // A long press is the terminal's own "start selecting" gesture,
+        // recognised in TerminalTabsPager. Left to Chromium, the same press
+        // would buzz and try its own selection/context menu at ~0.5s, well
+        // before ours fires.
+        setOnLongClickListener { true }
+        isHapticFeedbackEnabled = false
         // Keystrokes/resize come back through this bridge object,
         // matching the `window.NexusAndroid.*` calls in index.html.
         addJavascriptInterface(
@@ -170,12 +279,16 @@ fun createTerminal(
                 fun onResize(cols: Int, rows: Int) {
                     CoroutineScope(Dispatchers.Main).launch { onResize(cols, rows) }
                 }
+
+                // Read synchronously by index.html before its first fit.
+                @JavascriptInterface
+                fun initialFontSize(): Int = startFontSize
             },
             "NexusAndroid",
         )
     }
 
-    val handle = TerminalHandle(webView)
+    val handle = TerminalHandle(webView, startFontSize)
     webView.webViewClient = object : WebViewClient() {
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)

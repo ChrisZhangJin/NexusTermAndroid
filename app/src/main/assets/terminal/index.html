@@ -12,8 +12,13 @@
                    through evaluateJavascript's result callback: NexusAndroid
                    can't grow new methods without touching TerminalScreen.kt,
                    so pulling is the only way those facts reach Kotlin.
+                   ...and setFontSize / setVirtualCols / pasteBase64 /
+                   clearScreen / scrollToBottom / select*, driven by the
+                   gestures and the two-finger-hold menu in
+                   ui/TerminalTabsPager.kt.
     JS -> Kotlin:  window.NexusAndroid.onTermInput(utf8OrBase64String)   // keystrokes
                    window.NexusAndroid.onResize(cols, rows)              // on fit()
+                   window.NexusAndroid.initialFontSize()                 // once, at startup
   `NexusAndroid` is the addJavascriptInterface() object registered by
   TerminalScreen.kt. Everything here is deliberately framework-free (no
   bundler): it's a straight copy/trim of the xterm.js UMD build used by the
@@ -28,25 +33,446 @@
   html, body { height: 100%; margin: 0; padding: 0; background: #0c0c0c; overflow: hidden; }
   #terminal { height: 100%; width: 100%; }
   .xterm { padding: 4px; }
+  /* Virtual window: where the visible strip sits inside the wider canvas. */
+  #pan-indicator {
+    position: fixed; bottom: 1px; height: 3px; border-radius: 2px;
+    background: #5dcaa5; opacity: 0.35; display: none; pointer-events: none;
+    transition: opacity 0.3s;
+  }
+  #pan-indicator.active { opacity: 0.9; transition: none; }
+  /* Android-style selection handles: a drop whose point touches the text. */
+  .sel-handle {
+    position: fixed; width: 20px; height: 20px; background: #5dcaa5;
+    display: none; pointer-events: none; z-index: 10;
+  }
+  #sel-start { border-radius: 50% 0 50% 50%; transform-origin: 100% 0; }
+  #sel-end { border-radius: 0 50% 50% 50%; transform-origin: 0 0; }
+  /* Handles grow out of the text with a slight overshoot, as Android's do. */
+  .sel-handle.pop { animation: handle-pop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
+  @keyframes handle-pop { from { transform: scale(0); } to { transform: scale(1); } }
+  /* The touch-down ripple marking where a long press landed. */
+  .ripple {
+    position: fixed; width: 10px; height: 10px; margin: -5px 0 0 -5px;
+    border-radius: 50%; background: rgba(93, 202, 165, 0.5);
+    pointer-events: none; z-index: 9;
+    animation: ripple 0.55s ease-out forwards;
+  }
+  @keyframes ripple {
+    from { transform: scale(1); opacity: 0.9; }
+    to { transform: scale(16); opacity: 0; }
+  }
 </style>
 </head>
 <body>
 <div id="terminal"></div>
+<div id="pan-indicator"></div>
+<div id="sel-start" class="sel-handle"></div>
+<div id="sel-end" class="sel-handle"></div>
 <script src="xterm/xterm.js"></script>
 <script src="xterm/addon-fit.js"></script>
 <script>
 (function () {
+  // The size the user last pinched to is remembered on the Kotlin side
+  // (TerminalPrefs in ui/TerminalScreen.kt) and pulled synchronously here, so
+  // the very first fit -- and so the first size the remote pty hears about --
+  // already uses it instead of fitting at 14 and resizing a moment later.
+  var startFontSize = (window.NexusAndroid && window.NexusAndroid.initialFontSize)
+    ? window.NexusAndroid.initialFontSize()
+    : 14;
+
   var term = new Terminal({
     cursorBlink: true,
-    fontSize: 14,
+    fontSize: startFontSize,
     fontFamily: "monospace",
-    theme: { background: "#0c0c0c", foreground: "#e6e6e6" },
+    theme: {
+      background: "#0c0c0c",
+      foreground: "#e6e6e6",
+      selectionBackground: "rgba(93, 202, 165, 0.45)",
+    },
     scrollback: 5000,
   });
   var fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
-  term.open(document.getElementById("terminal"));
+  var host = document.getElementById("terminal");
+  term.open(host);
   fitAddon.fit();
+
+  /** Current cell size in CSS px -- the same private field the fit addon reads. */
+  function cell() {
+    return term._core._renderService.dimensions.css.cell;
+  }
+
+  function padLeft() {
+    return parseInt(window.getComputedStyle(term.element).getPropertyValue("padding-left")) || 0;
+  }
+
+  // ---- Virtual window ----
+  // With virtualCols set, #terminal is laid out wider than the screen -- wide
+  // enough for exactly that many columns -- and the page only ever shows a
+  // screen-wide strip of it, moved with a one-finger horizontal drag. Height
+  // stays the screen's: rows are still fitted, so vertical drags keep meaning
+  // "scroll the scrollback" and the two never compete for the same finger.
+  //
+  // The column count is fixed rather than the pixel width, so pinching inside
+  // the virtual window changes how much of it is on screen instead of reflowing
+  // the remote shell to a new width.
+  var virtualCols = 0;
+  var panX = 0;
+  var indicator = document.getElementById("pan-indicator");
+  var indicatorTimer = 0;
+
+  function maxPan() {
+    return Math.max(0, host.offsetWidth - window.innerWidth);
+  }
+
+  function applyPan() {
+    panX = Math.min(Math.max(0, panX), maxPan());
+    host.style.transform = panX ? "translateX(" + -panX + "px)" : "";
+    if (!virtualCols) {
+      indicator.style.display = "none";
+      return;
+    }
+    var total = host.offsetWidth || 1;
+    indicator.style.display = "block";
+    indicator.style.left = (panX / total) * window.innerWidth + "px";
+    indicator.style.width = (window.innerWidth / total) * window.innerWidth + "px";
+  }
+
+  /** Brighten the indicator while the strip is moving, then let it fade back. */
+  function flashIndicator() {
+    indicator.classList.add("active");
+    clearTimeout(indicatorTimer);
+    indicatorTimer = setTimeout(function () { indicator.classList.remove("active"); }, 600);
+  }
+
+  /**
+   * Fits the terminal to its box -- the screen, or in virtual mode a box sized
+   * to hold exactly virtualCols columns. Never reports the size by itself:
+   * callers decide whether this is a moment the remote pty should hear about.
+   */
+  function layout() {
+    var c = cell();
+    if (virtualCols && c.width) {
+      var s = window.getComputedStyle(term.element);
+      var padX = (parseInt(s.getPropertyValue("padding-left")) || 0) +
+        (parseInt(s.getPropertyValue("padding-right")) || 0);
+      // 14 is the scrollbar allowance the fit addon subtracts; the extra
+      // pixel keeps its floor() from landing one column short when
+      // virtualCols * cell width is a hair under a whole number.
+      host.style.width = Math.ceil(virtualCols * c.width + padX + 14 + 1) + "px";
+    } else {
+      host.style.width = "100%";
+    }
+    fitAddon.fit();
+    applyPan();
+  }
+
+  /** Pan just far enough that the cursor (plus a little context) is on screen. */
+  function revealCursor() {
+    var c = cell();
+    if (!virtualCols || !c.width) return;
+    var x = padLeft() + term.buffer.active.cursorX * c.width;
+    var margin = c.width * 4;
+    if (x - margin < panX) {
+      panX = x - margin;
+    } else if (x + c.width + margin > panX + window.innerWidth) {
+      panX = x + c.width + margin - window.innerWidth;
+    } else {
+      return;
+    }
+    applyPan();
+    flashIndicator();
+  }
+
+  // ---- One-finger drags ----
+  // Registered on window in the capture phase so they run before xterm's own
+  // touch handlers, and direction-locked once the finger has moved PAN_SLOP:
+  //
+  //  - horizontal, in the virtual window: pans it;
+  //  - vertical, over the normal buffer with no mouse tracking: scrolls the
+  //    scrollback here instead of in xterm. xterm's own touch scroll moves
+  //    the viewport 1:1 with the finger and stops dead on release, which on
+  //    a phone means many swipes to get anywhere; this one is SCROLL_GAIN
+  //    faster and keeps going with a fling. Anything else (vim, less, tmux
+  //    with the mouse on) is left to xterm, which knows how to turn a drag
+  //    into what that program expects.
+  //
+  // Every drag also feeds the key bar's two facts: that the user is doing
+  // something (it hides after a spell of idleness), and an overscroll --
+  // pushing up past the live bottom of the buffer -- which summons it back.
+  var PAN_SLOP = 8;
+  var SCROLL_GAIN = 1.6;
+  var FLING_MIN_VELOCITY = 0.3;   // px/ms of finger travel
+  var FLING_DECAY_MS = 325;       // time constant of the fling's slowdown
+  var SUMMON_PX = 60;
+  var touch = null;
+
+  // ms timestamp of the last thing the user did; read through uiState().
+  var lastActivity = Date.now();
+  // Set by an overscroll, cleared when uiState() reports it.
+  var summonRequested = false;
+
+  function noteActivity() {
+    lastActivity = Date.now();
+  }
+
+  function atBottom() {
+    var buf = term.buffer.active;
+    return buf.viewportY >= buf.baseY;
+  }
+
+  function ownsVerticalScroll() {
+    return term.modes.mouseTrackingMode === "none" && term.buffer.active.type === "normal";
+  }
+
+  // Sub-line remainder of the scroll, so slow drags still add up to lines.
+  var scrollRest = 0;
+
+  /** Scrolls by px (positive = towards the bottom); returns the lines moved. */
+  function scrollPx(px) {
+    var h = cell().height || 17;
+    scrollRest += px;
+    var n = scrollRest > 0 ? Math.floor(scrollRest / h) : Math.ceil(scrollRest / h);
+    if (n) {
+      scrollRest -= n * h;
+      term.scrollLines(n);
+    }
+    return n;
+  }
+
+  var flingFrame = 0;
+
+  function stopFling() {
+    if (flingFrame) cancelAnimationFrame(flingFrame);
+    flingFrame = 0;
+  }
+
+  /** v is the finger's release velocity in px/ms, positive = moving down. */
+  function startFling(v) {
+    stopFling();
+    if (Math.abs(v) < FLING_MIN_VELOCITY) return;
+    var last = performance.now();
+    function frame(now) {
+      var dt = now - last;
+      last = now;
+      scrollPx(-v * SCROLL_GAIN * dt);
+      v *= Math.exp(-dt / FLING_DECAY_MS);
+      var buf = term.buffer.active;
+      var atEdge = v > 0 ? buf.viewportY <= 0 : buf.viewportY >= buf.baseY;
+      if (Math.abs(v) < 0.02 || atEdge) {
+        flingFrame = 0;
+        scrollRest = 0;
+        return;
+      }
+      flingFrame = requestAnimationFrame(frame);
+    }
+    flingFrame = requestAnimationFrame(frame);
+  }
+
+  window.addEventListener("touchstart", function (e) {
+    noteActivity();
+    stopFling();
+    if (e.touches.length !== 1) {
+      touch = null;
+      return;
+    }
+    var t = e.touches[0];
+    touch = {
+      x: t.clientX, y: t.clientY, lastY: t.clientY, pan: panX, dir: null,
+      own: false, fromBottom: atBottom(), summoned: false,
+      samples: [{ y: t.clientY, t: performance.now() }],
+    };
+    scrollRest = 0;
+  }, { capture: true, passive: true });
+
+  window.addEventListener("touchmove", function (e) {
+    noteActivity();
+    if (!touch) return;
+    if (e.touches.length !== 1) {
+      touch = null;
+      return;
+    }
+    var x = e.touches[0].clientX;
+    var y = e.touches[0].clientY;
+    var dx = x - touch.x;
+    var dy = y - touch.y;
+    if (!touch.dir) {
+      if (Math.abs(dx) < PAN_SLOP && Math.abs(dy) < PAN_SLOP) return;
+      touch.dir = Math.abs(dx) > Math.abs(dy) ? "h" : "v";
+      touch.own = touch.dir === "v" && ownsVerticalScroll();
+    }
+
+    if (touch.dir === "h") {
+      if (!virtualCols) return;
+      e.stopPropagation();
+      if (e.cancelable) e.preventDefault();
+      panX = touch.pan - dx;
+      applyPan();
+      flashIndicator();
+      return;
+    }
+
+    // Finger travelling up while the buffer is already at its live bottom:
+    // there's nothing newer to show, so the drag means "give me the keys".
+    if (!touch.summoned && touch.fromBottom && atBottom() && -dy > SUMMON_PX) {
+      touch.summoned = true;
+      summonRequested = true;
+    }
+
+    if (!touch.own) return;
+    e.stopPropagation();
+    if (e.cancelable) e.preventDefault();
+    var now = performance.now();
+    touch.samples.push({ y: y, t: now });
+    while (touch.samples.length > 2 && now - touch.samples[0].t > 80) touch.samples.shift();
+    scrollPx(-(y - touch.lastY) * SCROLL_GAIN);
+    touch.lastY = y;
+  }, { capture: true, passive: false });
+
+  window.addEventListener("touchend", function (e) {
+    if (e.touches.length !== 0) return;
+    if (touch && touch.own) {
+      var s = touch.samples;
+      var first = s[0];
+      var last = s[s.length - 1];
+      // A finger that stopped before lifting has no fling left in it.
+      if (performance.now() - last.t < 60 && last.t > first.t) {
+        startFling((last.y - first.y) / (last.t - first.t));
+      }
+    }
+    touch = null;
+  }, { capture: true, passive: true });
+
+  // A second finger (claimed by Kotlin) or a long press cancels the stream.
+  window.addEventListener("touchcancel", function () {
+    touch = null;
+  }, { capture: true, passive: true });
+
+  // Chromium's own long press would otherwise reach xterm as a right click.
+  // The long press here means "select", and Kotlin recognises that one.
+  window.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }, { capture: true });
+
+  // overflow:hidden stops the user scrolling the page, not the browser: once
+  // #terminal is wider than the screen, focusing xterm's hidden textarea (the
+  // soft keyboard coming up) can scroll the document to "reveal" it, which
+  // would stack on top of the pan transform. The transform is the only scroll
+  // this page should ever have.
+  window.addEventListener("scroll", function () {
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+  });
+
+  // ---- Touch selection ----
+  // Kotlin recognises the gestures -- a one-finger long press starts it on
+  // the word under the finger, a one-finger drag moves its far end, a tap
+  // ends it -- and feeds the points in here as page coordinates; this side
+  // only maps them onto cells. Cells carry absolute buffer rows, so the
+  // selection stays put even if output arrives and scrolls the viewport.
+  //
+  // `sel` is the word the long press landed on (a..b, always selected) plus
+  // the range currently shown (s..e), which always contains it.
+  var sel = null;
+  var selStartHandle = document.getElementById("sel-start");
+  var selEndHandle = document.getElementById("sel-end");
+
+  function screenRect() {
+    return term.element.querySelector(".xterm-screen").getBoundingClientRect();
+  }
+
+  function cellAt(x, y) {
+    var c = cell();
+    var r = screenRect();
+    var col = Math.min(Math.max(0, Math.floor((x - r.left) / c.width)), term.cols - 1);
+    var row = Math.min(Math.max(0, Math.floor((y - r.top) / c.height)), term.rows - 1);
+    return { col: col, row: row + term.buffer.active.viewportY };
+  }
+
+  function before(p, q) {
+    return p.row < q.row || (p.row === q.row && p.col < q.col);
+  }
+
+  // What ends a "word": whitespace and the brackets/quotes/separators a shell
+  // line is punctuated with. Paths, URLs, flags and host:port stay whole.
+  var WORD_BREAK = /[\s()\[\]{}<>'"`,;|&]/;
+
+  /** The word at p as {a, b}, or just p's own cell if it isn't in one. */
+  function wordAt(p) {
+    var line = term.buffer.active.getLine(p.row);
+    function inWord(col) {
+      var c = line.getCell(col);
+      if (!c) return false;
+      // The right half of a wide (CJK) character belongs with its left half.
+      if (c.getWidth() === 0 && col > 0) return inWord(col - 1);
+      var ch = c.getChars();
+      return ch !== "" && !WORD_BREAK.test(ch);
+    }
+    if (!line || !inWord(p.col)) return { a: p, b: p };
+    var a = p.col;
+    var b = p.col;
+    while (a > 0 && inWord(a - 1)) a--;
+    while (b < term.cols - 1 && inWord(b + 1)) b++;
+    return { a: { col: a, row: p.row }, b: { col: b, row: p.row } };
+  }
+
+  function ripple(x, y) {
+    var el = document.createElement("div");
+    el.className = "ripple";
+    el.style.left = x + "px";
+    el.style.top = y + "px";
+    document.body.appendChild(el);
+    setTimeout(function () { el.remove(); }, 600);
+  }
+
+  /** Restart a handle's pop-in animation. */
+  function pop(el) {
+    el.classList.remove("pop");
+    void el.offsetWidth;
+    el.classList.add("pop");
+  }
+
+  /** Where a buffer cell is on screen, or null when it's scrolled out of view. */
+  function cellRect(p) {
+    var c = cell();
+    var r = screenRect();
+    var vr = p.row - term.buffer.active.viewportY;
+    if (vr < 0 || vr >= term.rows) return null;
+    return { left: r.left + p.col * c.width, bottom: r.top + (vr + 1) * c.height, width: c.width };
+  }
+
+  function placeHandle(el, rect, atLeft) {
+    if (!rect) {
+      el.style.display = "none";
+      return;
+    }
+    el.style.display = "block";
+    el.style.left = (atLeft ? rect.left - 20 : rect.left + rect.width) + "px";
+    el.style.top = rect.bottom + "px";
+  }
+
+  function placeHandles() {
+    if (!sel) return;
+    placeHandle(selStartHandle, cellRect(sel.s), true);
+    placeHandle(selEndHandle, cellRect(sel.e), false);
+  }
+
+  function showSelection(s, e) {
+    sel.s = s;
+    sel.e = e;
+    term.select(s.col, s.row, (e.row - s.row) * term.cols + e.col - s.col + 1);
+    placeHandles();
+  }
+
+  /** Stretch the selection from the long-pressed word out to p. */
+  function selectTo(p) {
+    if (before(p, sel.a)) showSelection(p, sel.b);
+    else if (before(sel.b, p)) showSelection(sel.a, p);
+    else showSelection(sel.a, sel.b);
+  }
+
+  // Output scrolling the viewport moves the selected text; the handles follow.
+  term.onScroll(placeHandles);
 
   // ---- Sticky Ctrl/Alt ----
   // The extra-keys row (ui/TerminalKeyBar.kt) arms these with a tap and the
@@ -96,13 +522,27 @@
   // handing them to nexus-core's write(). This mirrors the desktop app's
   // "whatever xterm emits, forward untouched" behaviour for key handling.
   function sendInput(data) {
+    // Typing is what the virtual window follows the cursor for -- output
+    // alone (a `top` repainting the whole screen) must not yank the view
+    // around, so cursor moves only count for a moment after input.
+    followCursorUntil = Date.now() + 1500;
+    noteActivity();
     if (window.NexusAndroid && window.NexusAndroid.onTermInput) {
       window.NexusAndroid.onTermInput(data);
     }
   }
 
+  var followCursorUntil = 0;
+  term.onCursorMove(function () {
+    if (Date.now() < followCursorUntil) revealCursor();
+  });
+
+  // Set for the duration of a menu paste, so an armed Ctrl doesn't turn the
+  // first character of the clipboard into a control code.
+  var pasting = false;
+
   term.onData(function (data) {
-    sendInput(applyModifiers(data));
+    sendInput(pasting ? data : applyModifiers(data));
   });
 
   function reportSize() {
@@ -112,7 +552,7 @@
   }
 
   window.addEventListener("resize", function () {
-    fitAddon.fit();
+    layout();
     reportSize();
   });
 
@@ -148,8 +588,107 @@
       term.clear();
     },
     fit: function () {
-      fitAddon.fit();
+      layout();
       reportSize();
+    },
+
+    /**
+     * Pinch-to-zoom. Called on every whole-pixel step of a pinch with
+     * commit=false -- the terminal reflows locally so the user sees the real
+     * result -- and once more with commit=true on release, which is the only
+     * call that tells the remote pty. One window-change per pinch, not one
+     * per step.
+     *
+     * In the virtual window the column count stays fixed, so a step only
+     * rescales the canvas; focusX (page px) is the pinch centre, kept over
+     * the same text so zooming feels anchored under the fingers.
+     */
+    setFontSize: function (px, commit, focusX) {
+      var oldWidth = cell().width;
+      if (term.options.fontSize !== px) term.options.fontSize = px;
+      layout();
+      var newWidth = cell().width;
+      if (virtualCols && oldWidth && newWidth && oldWidth !== newWidth) {
+        panX = (panX + focusX) * (newWidth / oldWidth) - focusX;
+        applyPan();
+      }
+      if (commit) reportSize();
+    },
+
+    /** 0 turns the virtual window off and fits back to the screen. */
+    setVirtualCols: function (cols) {
+      virtualCols = cols;
+      panX = 0;
+      layout();
+      reportSize();
+      if (cols) flashIndicator();
+    },
+
+    /**
+     * Clipboard text from the menu, base64 of its UTF-8 bytes. Through
+     * term.paste() so line endings and bracketed paste are handled exactly as
+     * a keyboard paste would be; paste() emits through onData synchronously,
+     * which is what lets the `pasting` flag bracket it.
+     */
+    pasteBase64: function (b64) {
+      var binary = atob(b64);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      pasting = true;
+      try {
+        term.paste(new TextDecoder().decode(bytes));
+      } finally {
+        pasting = false;
+      }
+    },
+
+    /** Clear locally, then Ctrl+L so the shell redraws its prompt. */
+    clearScreen: function () {
+      term.clear();
+      sendInput("\x0c");
+    },
+
+    /** Long press: select the word under (x, y), with Android's flourishes. */
+    selectBegin: function (x, y) {
+      stopFling();
+      var w = wordAt(cellAt(x, y));
+      sel = { a: w.a, b: w.b, s: w.a, e: w.b };
+      showSelection(w.a, w.b);
+      ripple(x, y);
+      pop(selStartHandle);
+      pop(selEndHandle);
+    },
+
+    /**
+     * Moves the far end of the selection to (x, y). Points above or below
+     * the screen nudge the viewport a line at a time, so a selection can be
+     * dragged past what's currently visible.
+     */
+    selectMove: function (x, y) {
+      if (!sel) return;
+      var r = screenRect();
+      if (y < r.top) term.scrollLines(-1);
+      else if (y > r.bottom) term.scrollLines(1);
+      selectTo(cellAt(x, y));
+    },
+
+    /**
+     * Ends the selection and returns its text for Kotlin to put on the
+     * clipboard. The highlight is left in place, as a record of what was
+     * copied, until xterm clears it on the next tap.
+     */
+    selectEnd: function () {
+      sel = null;
+      selStartHandle.style.display = "none";
+      selEndHandle.style.display = "none";
+      return term.getSelection();
+    },
+
+    scrollToBottom: function () {
+      stopFling();
+      term.scrollToBottom();
     },
 
     /**
@@ -168,23 +707,29 @@
     },
 
     setModifiers: function (ctrl, alt) {
+      noteActivity();
       ctrlArmed = !!ctrl;
       altArmed = !!alt;
     },
 
     /**
-     * Everything the key bar needs to paint itself, as "<atBottom><ctrl><alt>"
-     * in 0/1. Polled by Kotlin through evaluateJavascript's result callback:
+     * Everything the key bar needs, as "<atBottom><ctrl><alt><summon><idleMs>":
+     * four 0/1 flags -- summon is "1" once per overscroll -- then how long
+     * ago, in ms, the user last touched or typed into this terminal.
+     * Polled by Kotlin through evaluateJavascript's result callback:
      * `window.NexusAndroid` is built in ui/TerminalScreen.kt and can't grow an
      * event for "the user scrolled into the scrollback" or "the armed Ctrl was
-     * just spent", so a pull is the only channel available. Three characters
-     * keeps the poll cheap and spares the Kotlin side a JSON parse.
+     * just spent", so a pull is the only channel available. A few characters
+     * keep the poll cheap and spare the Kotlin side a JSON parse.
      */
     uiState: function () {
-      var buf = term.buffer.active;
-      return (buf.viewportY >= buf.baseY ? "1" : "0") +
+      var summon = summonRequested;
+      summonRequested = false;
+      return (atBottom() ? "1" : "0") +
         (ctrlArmed ? "1" : "0") +
-        (altArmed ? "1" : "0");
+        (altArmed ? "1" : "0") +
+        (summon ? "1" : "0") +
+        Math.min(Date.now() - lastActivity, 99999);
     },
   };
 })();
