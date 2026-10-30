@@ -8,10 +8,17 @@ metadata:
   modified: 2026-10-30T06:36:32.722Z
 ---
 
-On Android, `RLIMIT_MEMLOCK` for an app process is **65536 bytes, soft == hard**
-— a non-root process cannot raise the soft limit above the hard limit, so
-`setrlimit` at startup is a dead end. Measured on HONOR PTP-AN00 (Android 16,
-kernel 6.6.118) via `run-as com.nexusterm.android cat /proc/<pid>/limits`.
+`RLIMIT_MEMLOCK` for an app process **varies by 1024× across Android versions**.
+Measured via `run-as com.nexusterm.android cat /proc/<pid>/limits`:
+
+| phone | kernel | API | Max locked memory (soft == hard) |
+|---|---|---|---|
+| HONOR PTP-AN00 | 6.6.118 | 36 | **65536** (64 KiB) |
+| Xiaomi MI 8 SE | 4.9.186 | 29 | **67108864** (64 MiB) |
+
+Soft equals hard on both, so a non-root process cannot raise it — `setrlimit`
+at startup is a dead end. 64 MiB is effectively unlimited for a terminal
+session; 64 KiB is 16 pages and runs out almost immediately.
 
 `russh-cryptovec` 0.48.0 `src/platform/unix.rs` calls `panic!("Failed to lock
 memory")` when `libc::mlock` returns non-zero, with **no feature flag to disable
@@ -39,6 +46,6 @@ allocation to push past the budget — which is why it long *looked* like
 panic hook made it visible in one run. See [[rust-logging-on-android]].
 
 **How to apply:** if an SSH session dies with `reason="lost"` and no obvious
-cause, check logcat tag `NexusRust` for the mlock warning first. The Xiaomi
-MI 8 SE's limit was never measured — the device difference is explained but not
-independently confirmed. See [[test-devices]].
+cause, check logcat tag `NexusRust` for the mlock warning first. On a phone
+with the 64 MiB limit the warning never fires and this is not your bug — check
+the limit before assuming. See [[test-devices]].
