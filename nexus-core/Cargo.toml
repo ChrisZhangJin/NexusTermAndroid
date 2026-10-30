@@ -55,10 +55,19 @@ path = "uniffi-bindgen.rs"
 [patch.crates-io]
 russh = { path = "vendor/russh" }
 russh-sftp = { path = "vendor/russh-sftp" }
+# russh-cryptovec 0.48.0：mlock 失败不再 panic。
+# Android 的 RLIMIT_MEMLOCK 只有 64 KB（软硬限制相同，非 root 抬不动），
+# 上游在 libc 返回非 0 时直接 panic，于是 russh 的 client 任务当场猝死，
+# 表现为「连上约 50ms 后断线」。见 vendor/russh-cryptovec/PATCHES.md。
+russh-cryptovec = { path = "vendor/russh-cryptovec" }
 
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = "s"
 panic = "unwind"
-strip = true
+# 原本是 `strip = true`（符号表一起剥掉）。那样 `logging.rs` 里 panic hook
+# 抓到的 backtrace 只剩一串裸地址，等于没抓——而装那个 hook 的全部意义就是
+# 看清 tokio/russh 任务是在哪里死的。改成只剥 DWARF、保留符号表：.so 大几
+# 百 KB，换回可读的函数名。
+strip = "debuginfo"

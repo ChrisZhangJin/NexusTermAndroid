@@ -48,6 +48,24 @@ android {
         }
     }
 
+    // nexus-core 的 panic hook（nexus-core/src/logging.rs）会在 panic 时把
+    // backtrace 打进 logcat。但 AGP 的 stripDebugDebugSymbols 默认会把
+    // jniLibs 下每个 .so 的 .symtab 一起剥掉 —— 实测打包进 APK 的
+    // libnexus_core.so 里只剩 .dynsym，而 Rust 的内部函数几乎都不在 .dynsym
+    // 里，于是 backtrace 退化成一串裸地址，等于没有。
+    //
+    // 配合 nexus-core/Cargo.toml 里的 `strip = "debuginfo"`（保符号表、去
+    // DWARF），这里让 AGP 对这一个库手下留情，backtrace 才能带上函数名。
+    // 代价：arm64 的 .so 从 ~5.1MB 涨到 ~8.0MB。
+    //
+    // 这是为了定位「russh 任务为什么无声死掉」而开的，等那个问题收敛之后
+    // 可以把这段连同 Cargo.toml 的 strip 一起改回去。
+    packaging {
+        jniLibs {
+            keepDebugSymbols += "**/libnexus_core.so"
+        }
+    }
+
     buildFeatures {
         compose = true
     }

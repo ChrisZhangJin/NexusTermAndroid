@@ -151,8 +151,24 @@ fun SessionListScreen(
                             onEdit = { onEdit(session) },
                             onDelete = {
                                 scope.launch {
-                                    onDeleteRequested(session)
-                                    reloadTrigger++
+                                    // onDeleteRequested 最终落到 SessionStore.delete →
+                                    // UniFFI deleteSession，会抛 StoreException。这里原本
+                                    // 是裸 launch：SQLite 一报错（库被占、磁盘满）异常
+                                    // 就从 rememberCoroutineScope 里逃出去，没有任何
+                                    // handler，直接带走进程 —— 和 MainActivity 里按键
+                                    // 写入那条崩溃链是同一个形状。复用本屏已有的
+                                    // errorMessage 呈现，不另造 UI。
+                                    try {
+                                        onDeleteRequested(session)
+                                        reloadTrigger++
+                                    } catch (e: StoreException) {
+                                        // 失败时**不**bump reloadTrigger：上面那个
+                                        // LaunchedEffect(reloadTrigger) 开头就会把
+                                        // errorMessage 清成 null，刚写进去的提示会被
+                                        // 它当场抹掉，用户只看到一闪。删除失败意味着
+                                        // 库里什么都没变，本来也不需要重读。
+                                        errorMessage = e.message ?: "删除失败"
+                                    }
                                 }
                             },
                         )

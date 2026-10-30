@@ -10,6 +10,7 @@
 pub mod errors;
 pub mod keys;
 pub mod listener;
+pub mod logging;
 pub mod sftp;
 pub mod ssh;
 pub mod store;
@@ -45,6 +46,12 @@ pub(crate) fn manager() -> &'static ssh::session::SessionManager {
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        // 兜底：正常路径上 Kotlin 会在 Application.onCreate 里先调
+        // `init_logging()`（那是最早、覆盖面最全的时机）。但 runtime 是
+        // 所有异步工作的入口，万一宿主漏调了，至少保证读写循环跑起来之前
+        // subscriber 和 panic hook 已经就位——否则会话一断又是一片空白。
+        // `logging::init` 本身是 `Once` 保护的，重复调用无副作用。
+        logging::init(None);
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -94,6 +101,29 @@ impl From<String> for StoreError {
     fn from(e: String) -> Self {
         StoreError::Failed(e)
     }
+}
+
+/// 装好 Rust 侧的 panic hook 与 tracing subscriber，把两者都接到 logcat。
+///
+/// **应当是 Kotlin 在 `Application.onCreate` 里做的第一件事**，比
+/// [`init_store`] 还早——在这之前发生的任何 panic 或 tracing 事件都没有
+/// 去处（Android app 进程的 stderr 是 `/dev/null`，而未安装 subscriber 的
+/// `tracing` 事件会被直接丢弃）。这正是为什么之前「russh 任务为什么死」
+/// 查不到：`ssh/session.rs` 读循环末尾那句带 `reason` 的「会话结束」一直
+/// 在发，只是没人听。
+///
+/// 幂等：内部用 `Once`，重复调用（Activity 重建、宿主兜底）是空操作。
+/// 另外 [`runtime()`] 也会兜底调一次，所以即使宿主忘了调，会话相关的日志
+/// 仍然看得到——只是会漏掉启动早期的部分。
+///
+/// `filter` 为 `None` 时用默认的 `info,nexus_core=debug`（并尊重
+/// `RUST_LOG`，尽管 Android 上一般设不了）。传 `Some("nexus_core=trace")`
+/// 之类可以在不重新编译 Rust 的前提下临时加大音量。
+///
+/// 日志统一打在 tag `NexusRust` 下，见 [`logging::LOG_TAG`]。
+#[uniffi::export]
+pub fn init_logging(filter: Option<String>) {
+    logging::init(filter);
 }
 
 /// 打开（或在已打开时直接视为成功的）会话库。

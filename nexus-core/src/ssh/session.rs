@@ -1039,7 +1039,11 @@ async fn read_loop(
                     }
                     // 数据不走这条路
                     SessionInput::Data(bytes) => {
-                        if channel.data(&bytes[..]).await.is_err() {
+                        // 原来是 `.is_err()`，错误被整个丢掉——于是 `reason=lost`
+                        // 只说明「断了」，不说明「为什么断」。把 russh 的错误原文
+                        // 打出来，否则排障时这里和下面那条 Data 分支完全无法区分。
+                        if let Err(e) = channel.data(&bytes[..]).await {
+                            tracing::warn!(session = id, error = %e, bytes = bytes.len(), "ctrl 分支写通道失败，判定连接丢失");
                             info.reason = "lost";
                             break;
                         }
@@ -1090,7 +1094,20 @@ async fn read_loop(
                     }
                     // None：底层连接已断（keepalive 超时 / TCP 重置）。若之前收到过
                     // ExitStatus 则仍算正常退出
-                    None => break,
+                    //
+                    // `wait()` 返回 None 等于「russh 那条任务没了」——可能是
+                    // 它自己 panic 了（这种情况 logging.rs 的 panic hook 会在
+                    // 这条之前先打一条 ☠️ ），也可能是 TCP 真的断了。两者在
+                    // 这一层无法区分，所以这里只负责把「走到了这个分支」这件
+                    // 事本身记下来，配合上面的 panic 记录就能分辨。
+                    None => {
+                        tracing::warn!(
+                            session = id,
+                            prior_reason = info.reason,
+                            "channel.wait() 返回 None：底层连接/russh 任务已结束"
+                        );
+                        break;
+                    }
                 }
             }
             Some(input) = data_rx.recv() => {
@@ -1098,7 +1115,12 @@ async fn read_loop(
                     SessionInput::Data(bytes) => {
                         // 这里是全链路唯一的「等」：远端窗口满时 russsh 会挂住，
                         // 队列随即填满，前端的写入 await 便跟着停下来
-                        if channel.data(&bytes[..]).await.is_err() {
+                        //
+                        // 同上：错误原文必须打出来。这条分支是崩溃链的起点——
+                        // 它一 break，`data_rx` 就被 drop，下一次 `write()` 立刻
+                        // 拿到 `Channel("输入通道已关闭")`。
+                        if let Err(e) = channel.data(&bytes[..]).await {
+                            tracing::warn!(session = id, error = %e, bytes = bytes.len(), "写通道失败，判定连接丢失");
                             info.reason = "lost";
                             break;
                         }
@@ -1151,10 +1173,14 @@ fn sidecar_error(e: &russh::Error) -> String {
 /// 记一条会话结束日志。
 ///
 /// 桌面版把这行写进 `<app_data>/sessions.log`（GUI 版本看不到控制台输出，
-/// 排障靠这个文件）。Android 没有等价的 `AppHandle::path()`，而 `tracing`
-/// 本身就能落到 logcat（宿主在 `connect()` 之前装好
-/// `tracing-android`/等价 subscriber 即可），所以这里退化成一条结构化
-/// tracing 记录，字段与原文件格式一一对应，方便日后如果要落盘也能照抄。
+/// 排障靠这个文件）。Android 没有等价的 `AppHandle::path()`，所以这里退化成
+/// 一条结构化 tracing 记录，字段与原文件格式一一对应，方便日后如果要落盘
+/// 也能照抄。
+///
+/// 这条记录真正落到 logcat，靠的是 `crate::logging` 里的 subscriber——它由
+/// 导出的 `init_logging()`（Kotlin 在 `Application.onCreate` 调）安装，
+/// `crate::runtime()` 里还有一道兜底。在补上那个模块之前，这里写的每一条
+/// 都被直接丢弃，于是「会话为什么断」在设备上查不到，这正是它存在的理由。
 fn log_session_end(
     id: &str,
     info: &ClosedInfo,

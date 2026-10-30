@@ -1,0 +1,5 @@
+- [adb USB node mknod](adb-usb-node-mknod.md) — empty `adb devices` is a stale container bind mount, not a dead cable.
+- [Test devices](test-devices.md) — MI 8 SE (API 29) and HONOR PTP-AN00 (API 36); the gap is what the SDK branches hinge on.
+- [Orchestrator mode](orchestrator-mode.md) — dispatch subtasks to agents; device work stays sequential.
+- [Android mlock rlimit](android-mlock-rlimit.md) — 64KB RLIMIT_MEMLOCK made russh-cryptovec panic and kill SSH sessions; vendored patch.
+- [Rust logging on Android](rust-logging-on-android.md) — how panics/tracing reach logcat tag `NexusRust`, and the clean-build trap.

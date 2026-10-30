@@ -346,14 +346,30 @@ class MainActivity : ComponentActivity() {
                             // Read `live.liveSessionId` at call time, not
                             // capture time — it's still "" right now, and a
                             // reconnect will replace it again later.
+                            // 这两个 lambda 是整个 app 里唯一「每次按键 / 每次
+                            // 重排都会跨 FFI」的路径，也是之前进程猝死的现场：
+                            // 读循环一旦 break 就把 data_rx drop 掉，下一次
+                            // write() 立刻拿到 SessionException.Channel
+                            // （"输入通道已关闭"），而裸 lifecycleScope.launch
+                            // 里抛出的异常没有任何 handler —— 直接杀进程。
+                            // 一次按键不该有这种后果，所以两边都收口到
+                            // handleLiveFfiFailure。
                             onInput = { text ->
                                 lifecycleScope.launch {
-                                    SshClient.write(live.liveSessionId, text.toByteArray(Charsets.UTF_8))
+                                    try {
+                                        SshClient.write(live.liveSessionId, text.toByteArray(Charsets.UTF_8))
+                                    } catch (e: SessionException) {
+                                        handleLiveFfiFailure(live, e, "发送按键")
+                                    }
                                 }
                             },
                             onResize = { cols, rows ->
                                 lifecycleScope.launch {
-                                    SshClient.resize(live.liveSessionId, cols, rows)
+                                    try {
+                                        SshClient.resize(live.liveSessionId, cols, rows)
+                                    } catch (e: SessionException) {
+                                        handleLiveFfiFailure(live, e, "同步窗口尺寸")
+                                    }
                                 }
                             },
                         )
@@ -669,6 +685,65 @@ class MainActivity : ComponentActivity() {
             "已重试 $RECONNECT_MAX 次仍未连上，停止自动重连。请关闭此标签后手动重新连接",
             SGR_RED,
         )
+    }
+
+    /**
+     * What to do when a *per-interaction* FFI call (keystroke, resize) against
+     * a live session throws. Runs on the main dispatcher, so touching Compose
+     * state and the WebView from here is safe.
+     *
+     * The crash this exists for: nexus-core's read loop ends (`reason=lost`),
+     * which drops `data_rx`; the very next `write()` gets
+     * `SessionError::Channel("输入通道已关闭")` back, UniFFI lifts it into
+     * [SessionException.Channel], and an unguarded `lifecycleScope.launch`
+     * has nowhere to put it — the process dies on a keystroke. Catching is
+     * necessary but not sufficient: swallowing it would leave the user typing
+     * into a terminal that silently eats everything, which is arguably worse.
+     *
+     * So the two variants are treated differently:
+     *
+     * - [SessionException.Channel] / [SessionException.NotFound] both mean
+     *   *this session no longer exists on the Rust side* — Channel because its
+     *   input queue is closed, NotFound because `SessionManager` has already
+     *   dropped the registry entry. That is exactly the state `onClosedCallback`
+     *   reports as [CLOSE_REASON_LOST], so it's routed into the same machinery:
+     *   flip to [LinkState.RECONNECTING] and bump [LiveSession.dropCount],
+     *   which the per-tab `snapshotFlow` collector turns into a [reconnectLoop].
+     *   Not a new UI — the retry ladder writes its own progress notices.
+     *
+     *   Why this matters even though `on_closed` normally fires too: the two
+     *   race, and either can land first. If the write throws first we start
+     *   reconnecting ~immediately instead of waiting for the callback; if the
+     *   callback won, [LiveSession.state] is already RECONNECTING and the guard
+     *   below makes this a no-op rather than a second ladder from attempt 1.
+     *
+     * - Anything else (Connect/Auth/HostKeyMismatch — not reachable from
+     *   write/resize today, but the `when` in [friendlyText] is exhaustive and
+     *   this shouldn't start crashing if that changes) is reported in the
+     *   terminal and otherwise left alone: we don't know the session is dead,
+     *   so tearing it down would be guessing.
+     *
+     * The CONNECTED guard also debounces: `onResize` fires repeatedly while the
+     * IME animates, and without it a dead session would paint a wall of
+     * identical red notices over the user's scrollback.
+     */
+    private fun handleLiveFfiFailure(live: LiveSession, e: SessionException, action: String) {
+        val sessionIsGone = e is SessionException.Channel || e is SessionException.NotFound
+
+        if (!sessionIsGone) {
+            Log.w(TAG, "$action 失败 tab=${live.tabId}", e)
+            live.terminal?.writeNotice("$action 失败：${e.friendlyText()}", SGR_RED)
+            return
+        }
+
+        // Already reconnecting (or given up)? The existing machinery owns the
+        // session from here; staying quiet is the whole point of the guard.
+        if (live.state != LinkState.CONNECTED) return
+
+        Log.w(TAG, "$action 时发现会话已失效 tab=${live.tabId}，转入自动重连", e)
+        live.terminal?.writeNotice("连接已失效（$action 时发现：${e.friendlyText()}）", SGR_RED)
+        live.state = LinkState.RECONNECTING
+        live.dropCount++
     }
 
     /**
