@@ -718,7 +718,13 @@ mod tests {
             .and_then(|p| p.parse().ok())
             .unwrap_or(22);
 
+        // 这条测试走的是「独立拨号」那条路：进程里没有登记任何终端连接，
+        // 给一个一次性的 config_id 就保证复用查找一定落空，不会被同机其他
+        // 用例留下的连接串台。
+        let config_id = format!("sftp-test-{}", uuid::Uuid::new_v4());
+
         let handle = sftp_connect(
+            config_id,
             host,
             port,
             user,
