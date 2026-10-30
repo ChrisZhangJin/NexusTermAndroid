@@ -116,6 +116,18 @@ pub enum AuthMethod {
 /// 之后看起来像卡死，其实是在等网络把积压发完。
 const INPUT_QUEUE: usize = 16;
 
+/// 输出投递队列的容量（按消息条数）。见 [`spawn_event_delivery`]。
+///
+/// **不要照抄 [`INPUT_QUEUE`]**：那是输入方向的，每条几十字节、一次 ZMODEM
+/// 分片 256KB，16 条就够。输出方向的突发特征完全不同 —— 一次 `tmux attach`
+/// 的重绘实测是 150+ 个小块、总共才 18 KB，块多而每块小。队列若按输入那样
+/// 定成 16，光一次 attach 就要把读循环顶住十来次。
+///
+/// 256 的取法：覆盖实测突发（150+）并留一倍余量；上界由 russh 的通道窗口
+/// 决定，单块不超过 32KB，于是最坏占用 256 × 32KB ≈ 8MB —— 有界、可接受。
+/// 再大就只是把「远端狂吐数据」的内存压力往后推，并不能解决根因。
+const OUTPUT_QUEUE: usize = 256;
+
 /// 旁路通道被服务端拒绝时返回的文案。
 ///
 /// 前端靠这段文字识别「这台机器只允许一条通道」（企业堡垒机很常见），
@@ -1007,6 +1019,58 @@ pub struct ClosedInfo {
     pub reason: &'static str,
 }
 
+/// 送往 Kotlin 监听者的事件。
+///
+/// 数据和「会话已结束」必须走**同一条**队列：若 `on_closed` 绕过队列直接调，
+/// 它就会插到尚未投递的数据前面，Kotlin 侧先收到「会话已关闭」、再收到最后
+/// 几屏输出 —— 前端据此关标签页，用户就永远看不到退出前的报错。
+enum OutEvent {
+    Data(Vec<u8>),
+    Closed { reason: String },
+}
+
+/// 起一条**专用**的 blocking 投递任务，返回它的入口队列和 join 句柄。
+///
+/// 为什么不是「每块数据 `spawn_blocking` 一下」：
+///
+/// - 带 `.await`（本次修复前的写法）等于没换：`.await` 在 select! 分支里会把
+///   整条读循环挂起，直到回调跑完。换了个线程跑，循环照样等 —— 慢的 Kotlin
+///   监听者依旧拖住读循环，连带单列出来的 `ctrl_rx` 一路（resize / close）
+///   也一起卡住，而那一路存在的全部意义就是「上传堵满时断开仍要能立刻生效」。
+/// - 去掉 `.await` 改成 fire-and-forget 更糟：多个 `spawn_blocking` 任务会
+///   **并发**执行，终端字节流一旦乱序，xterm.js 的解析状态机就直接坏掉，
+///   屏幕上是花屏而不是「慢一点」。**终端数据必须严格保序**，这是这段代码
+///   最硬的约束，改动时第一个要守住的就是它。
+///
+/// 所以：单生产者（读循环）→ 有界队列 → **单消费者**（这条任务），顺序由
+/// 「只有一个消费者、串行地一条条调 `on_data`」保证。读循环不再等回调跑完，
+/// 只在队列满时等 —— 那是正确的背压（否则远端狂吐数据会让内存无限增长）。
+///
+/// 生命周期：与会话同生共死。读循环退出时发一条 [`OutEvent::Closed`] 再 drop
+/// 发送端，这条任务把队列里剩下的数据投完、调一次 `on_closed`，然后自然结束。
+fn spawn_event_delivery(
+    listener: Arc<dyn TerminalEventListener>,
+    id: String,
+) -> (mpsc::Sender<OutEvent>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<OutEvent>(OUTPUT_QUEUE);
+    // spawn_blocking 而非 spawn：UniFFI 的回调接口是同步方法，Kotlin 侧随手
+    // 写点耗时操作并不违约（见 listener.rs 的说明），不能占着异步 worker 线程。
+    let handle = tokio::task::spawn_blocking(move || {
+        while let Some(ev) = rx.blocking_recv() {
+            match ev {
+                OutEvent::Data(bytes) => listener.on_data(id.clone(), bytes),
+                OutEvent::Closed { reason } => {
+                    listener.on_closed(id.clone(), reason);
+                    // 关闭之后不可能再有输出；显式退出，杜绝 on_closed 之后
+                    // 还往前端塞 on_data 这种前端最难排查的时序问题。
+                    break;
+                }
+            }
+        }
+    });
+    (tx, handle)
+}
+
 /// 读写主循环。select! 同时处理「远端数据」「本地输入」「控制指令」三条流。
 ///
 /// 控制流单列一路：上传把数据队列堵满时，resize / close 仍要能立刻生效，
@@ -1022,6 +1086,8 @@ async fn read_loop(
 ) {
     let opened_at = epoch_ms();
     let mut info = ClosedInfo { code: 0, reason: "lost" };
+    // 所有发往前端的事件都从这里走，顺序即投递顺序。详见 spawn_event_delivery。
+    let (out_tx, out_task) = spawn_event_delivery(listener, id.clone());
     loop {
         tokio::select! {
             Some(ctrl) = ctrl_rx.recv() => {
@@ -1058,12 +1124,21 @@ async fn read_loop(
                         // 「跨 IPC 必须是文本」的约束，也不会切断多字节字符的问题——
                         // Kotlin 侧原样喂给 xterm.js 的 writeUtf8 / write(Uint8Array)。
                         //
-                        // 回调是同步调用，放进 spawn_blocking 避免阻塞本 select! 循环
-                        // （Kotlin 实现里如果有一点点耗时操作，不该拖慢整条读循环）。
-                        let l = listener.clone();
-                        let sid = id.clone();
-                        let payload = data.to_vec();
-                        let _ = tokio::task::spawn_blocking(move || l.on_data(sid, payload)).await;
+                        // 只把数据丢进投递队列，不在这里等回调跑完 —— 否则慢的
+                        // Kotlin 监听者会拖住整条读循环，连 ctrl_rx 那一路也一起卡。
+                        //
+                        // 这里仍有一个 `.await`，但它等的是**队列有空位**而不是
+                        // 回调执行完：队列满说明前端已经落后 OUTPUT_QUEUE 个块，
+                        // 此时放慢读取正是我们要的背压（不然远端狂吐数据，积压
+                        // 全堆在本进程内存里）。代价是这种极端情况下 ctrl_rx 会
+                        // 跟着等，但等待上界是「一次 on_data 的耗时」，不再是
+                        // 修复前的「每一块都等一次」。
+                        if out_tx.send(OutEvent::Data(data.to_vec())).await.is_err() {
+                            // 只可能是投递任务没了（Kotlin 回调 panic）。数据没人
+                            // 收了，但连接本身还好，不改变 reason、不额外 break ——
+                            // 让既有的三条退出路径继续决定会话怎么结束。
+                            tracing::warn!(session = id, "事件投递任务已结束，丢弃一块输出");
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { data, ext, .. }) => {
                         if ext == 1 {
@@ -1143,10 +1218,14 @@ async fn read_loop(
     }
     tracing::info!(session = id, reason = info.reason, code = info.code, "会话结束");
     log_session_end(&id, &info, opened_at, sidecar, &last_sidecar);
+    // 关闭事件也必须走同一条队列排在数据后面，不能直接调回调插队，
+    // 否则前端会先收到「已关闭」再收到最后几屏输出（比如退出前的报错）。
     let reason = info.reason.to_string();
-    let l = listener.clone();
-    let sid = id.clone();
-    let _ = tokio::task::spawn_blocking(move || l.on_closed(sid, reason)).await;
+    let _ = out_tx.send(OutEvent::Closed { reason }).await;
+    // drop 发送端，投递任务收完队列里剩下的东西后自然退出；
+    // await 它是为了保持原有语义：read_loop 结束时 on_closed 已经送达。
+    drop(out_tx);
+    let _ = out_task.await;
 }
 
 fn epoch_ms() -> i64 {
@@ -1707,5 +1786,92 @@ mod kbi_probe {
             "第二轮应明确告知口令错：{:?}",
             msgs[1]
         );
+    }
+}
+
+#[cfg(test)]
+mod out_delivery_tests {
+    //! 守住 [`spawn_event_delivery`] 的两条不变式。
+    //!
+    //! 这两条都是「改坏了也能编译、也能连上、只有真机上花屏/早关标签」的
+    //! 类型，靠人眼 review 很难发现，所以必须有测试钉住：
+    //! 1. `on_data` 的顺序 == 入队顺序（并发投递会让 xterm.js 花屏）；
+    //! 2. `on_closed` 永远排在所有数据之后（否则前端提前关掉标签页，
+    //!    用户看不到退出前的报错）。
+
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// 记录回调的实际调用顺序。数据记成块里的序号，关闭记成 -1。
+    struct OrderRecorder {
+        seen: Arc<StdMutex<Vec<i32>>>,
+    }
+
+    impl TerminalEventListener for OrderRecorder {
+        fn on_data(&self, _session_id: String, bytes: Vec<u8>) {
+            let n = i32::from_le_bytes(bytes[..4].try_into().unwrap());
+            // 第一块故意慢一点：若有人把投递改回「每块一个 spawn_blocking」
+            // 的并发写法，这一块就会落到后面去，顺序断言随即失败。
+            if n == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            self.seen.lock().unwrap().push(n);
+        }
+        fn on_pulse(&self, _session_id: String) {}
+        fn on_closed(&self, _session_id: String, _reason: String) {
+            self.seen.lock().unwrap().push(-1);
+        }
+        fn on_auth_prompt(&self, _prompt: AuthPrompt) -> String {
+            String::new()
+        }
+    }
+
+    /// 块数取成队列容量的数倍，确保中途真的把队列压满、走到背压那条路上。
+    const BLOCKS: i32 = (OUTPUT_QUEUE * 3) as i32;
+
+    #[tokio::test]
+    async fn delivers_in_order_and_closes_last() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let listener = Arc::new(OrderRecorder { seen: seen.clone() });
+        let (tx, task) = spawn_event_delivery(listener, "s1".to_string());
+
+        for n in 0..BLOCKS {
+            tx.send(OutEvent::Data(n.to_le_bytes().to_vec()))
+                .await
+                .expect("投递任务不应提前结束");
+        }
+        tx.send(OutEvent::Closed {
+            reason: "exit".to_string(),
+        })
+        .await
+        .expect("关闭事件应当能入队");
+        drop(tx);
+        task.await.expect("投递任务不应 panic");
+
+        let got = seen.lock().unwrap().clone();
+        let mut want: Vec<i32> = (0..BLOCKS).collect();
+        want.push(-1);
+        assert_eq!(got, want, "投递顺序必须与入队顺序严格一致，且关闭排在最后");
+    }
+
+    /// 收到 `Closed` 之后投递任务必须退出：之后就算还有数据也不该再调 `on_data`。
+    #[tokio::test]
+    async fn stops_after_closed() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let listener = Arc::new(OrderRecorder { seen: seen.clone() });
+        let (tx, task) = spawn_event_delivery(listener, "s2".to_string());
+
+        tx.send(OutEvent::Closed {
+            reason: "user".to_string(),
+        })
+        .await
+        .unwrap();
+        // 现实里不会有，但万一将来有人在 read_loop 退出后又塞了数据，
+        // 前端也绝不能在「已关闭」之后再收到输出。
+        let _ = tx.send(OutEvent::Data(7i32.to_le_bytes().to_vec())).await;
+        drop(tx);
+        task.await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().clone(), vec![-1]);
     }
 }
