@@ -224,7 +224,20 @@ private class LiveSession(
      */
     val openedAtMillis: Long = System.currentTimeMillis()
 
-    val tabTitle: String get() = displayName + statusSuffix
+    /**
+     * 用户在切换器里给这条标签起的名字，null = 没起过，用 [displayName]。
+     *
+     * 只活在内存里、跟着标签走（标签关了就没了），所以放在 [LiveSession] 而不是
+     * 存进保存的配置：它标识的是「这一条标签」，同一个主机开两条标签可以各叫各的。
+     * 是 Compose 状态，改了之后切换器、首页的「断开哪个标签？」菜单和通知栏的
+     * 标题都会跟着读到新值（它们读的都是 [tabTitle]）。
+     */
+    var customName by mutableStateOf<String?>(null)
+
+    /** 用户看到的标签名，不含状态后缀：自定义名优先，否则是配置名/主机。 */
+    val shownName: String get() = customName ?: displayName
+
+    val tabTitle: String get() = shownName + statusSuffix
 }
 
 class MainActivity : ComponentActivity() {
@@ -625,6 +638,7 @@ class MainActivity : ComponentActivity() {
                                             TerminalTab(
                                                 id = session.tabId,
                                                 title = session.tabTitle,
+                                                name = session.shownName,
                                                 handle = it,
                                             )
                                         }
@@ -640,6 +654,11 @@ class MainActivity : ComponentActivity() {
                                         liveSessions.firstOrNull { it.tabId == id }?.let {
                                             navController.navigate("sftp/${it.savedSessionId}")
                                         }
+                                    },
+                                    // 空白 = 清掉自定义名，回到配置名/主机。
+                                    onRenameTab = { id, name ->
+                                        liveSessions.firstOrNull { it.tabId == id }?.customName =
+                                            name.trim().takeIf { it.isNotEmpty() }
                                     },
                                 )
                             }

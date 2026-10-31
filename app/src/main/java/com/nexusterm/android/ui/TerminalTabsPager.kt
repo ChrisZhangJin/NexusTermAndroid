@@ -8,6 +8,7 @@ import android.webkit.WebView
 import android.widget.Toast
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -15,16 +16,25 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -37,8 +47,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
@@ -51,17 +65,31 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.hypot
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 /** One live terminal, as far as this screen is concerned. */
 data class TerminalTab(
     val id: String,
     val title: String,
     val handle: TerminalHandle,
+    /**
+     * [title] without the status suffix（"（重连中 3/10）"）：改名对话框预填、
+     * 编辑的是这个，不是带后缀的显示文字。默认等于 [title]，不关心改名的调用点不用管。
+     */
+    val name: String = title,
 )
 
 /** Drag distance that takes the switcher from fully closed to fully open. */
@@ -89,8 +117,54 @@ private const val OPEN_THRESHOLD = 0.4f
  */
 private val PinchStepPerFontSize = 22.dp
 
-/** Card scale when fully open. The 0.28 gap is what lets neighbours peek in. */
-private const val OPEN_SCALE = 0.72f
+/**
+ * Card scale when fully open. Smaller than the old flat carousel's 0.72: the
+ * cards now fan out on a wheel and have to leave room for it below, and a
+ * narrower card is also what lets the neighbours' inner corners peek in at the
+ * screen edges without overlapping the centre one (see [WHEEL_STEP_DEG]).
+ */
+private const val OPEN_SCALE = 0.62f
+
+/**
+ * 相邻两张卡片在转盘上差多少度。
+ *
+ * 取 27° 是几个约束夹出来的（按 360×780dp 量的，别的屏幕比例会差一点）：卡片
+ * 底边离转盘圆心约 480dp，两张相邻卡片的底边是离圆心最近、也就是靠得最紧的地方，
+ * 弦长 2·480·sin(13.5°) ≈ 224dp 要不小于卡片宽度 0.62×360 ≈ 223dp，否则底角会
+ * 互相压住——所以不能再小；再大则邻居的内侧底角被甩出屏幕外，什么都看不见。
+ * 27° 时它刚好从屏幕左右两边各露出一个楔形的角，和草图里「摆在大轮子上的卡片」
+ * 一致。
+ */
+private const val WHEEL_STEP_DEG = 27f
+
+/**
+ * 转盘外圆半径 = 屏幕宽度的这么多倍。比整个屏幕宽一点，圆心就在屏幕下方很远
+ * 的地方，露出来的只有一段上弧，像一座拱桥；再大弧会太平，转起来没有「轮子」
+ * 的感觉，再小则卡片围着它的半径变小、同样角度下邻居靠得更紧。
+ */
+private const val WHEEL_RADIUS_PER_WIDTH = 1.15f
+
+/** 转盘最高点露出屏幕底边多少：环带和标签就住在这一截里。 */
+private val WheelRise = 100.dp
+
+/** 环带厚度（外圆半径往里数）。标签放在它的中线上，所以要比一行字高得多。 */
+private val WheelRingThickness = 60.dp
+
+/**
+ * 中间那张卡片相对关闭时往上抬多少。抬不抬都不影响转动——卡片是绕转盘圆心
+ * 转的，抬起来只是把它到圆心的距离拉长了一点——纯粹为了和环带之间多留点空。
+ */
+private val CardLift = 16.dp
+
+/** 邻居卡片的不透明度；中间那张是 1，按离中心的页距离线性过渡。 */
+private const val NEIGHBOUR_ALPHA = 0.7f
+
+/**
+ * 页偏移的钳位。分页器在快速甩动时会同时拉出更远的页，它们的偏移可以到几页
+ * 以外；不钳的话 `offset × 27°` 会把它们转到圆的另一侧去。位置抵消（
+ * translationX）不受它影响，那个必须用真实偏移才抵得掉分页器自己的平移。
+ */
+private const val MAX_WHEEL_OFFSET = 2.5f
 
 /** Fraction of the screen a card must be flung up before it counts as closed. */
 private const val DISMISS_FRACTION = 0.22f
@@ -101,7 +175,22 @@ private const val DISMISS_FRACTION = 0.22f
  * either side of it; swipe left/right to choose one, tap it to switch, flick it
  * up to disconnect it, or two-finger drag back up to cancel.
  *
- * There is no permanent tab strip — the cards carry the session names — so the
+ * ## 转盘（拱桥）外观
+ *
+ * 打开之后不是一排平铺的小卡片，而是一个转盘：当前这张卡片立在屏幕中间，邻居
+ * 卡片像摆在一个大轮子上那样向两侧倾斜；轮子的圆心在屏幕下方很远处，只有最上面
+ * 一段弧露在屏幕底部，像拱桥。会话名就写在这段弧的环带上，环带上相邻两个会话之间
+ * 各有一条径向刻线，左右一划轮子就跟着转（见 [SessionWheel]）。点这段拱桥（整个环带，不只是名字）可以改名
+ * （[RenameTabDialog]）。
+ *
+ * 实现上卡片和轮子是同一个圆心：每页在 [graphicsLayer] 里先抵消分页器自己的
+ * 水平平移（所有页叠在屏幕中央），再绕「圆心所在的那个点」转 `偏移 × 27°`；
+ * 转盘本身是分页器的兄弟节点（和 [TerminalKeyBar] 一样属于屏幕而不属于某一页，
+ * 所以不会跟着哪张卡片转）。全程仍然只用 [graphicsLayer]，页面布局尺寸不变，
+ * 见下面「为什么页面永远是满屏」。关闭时（进度 0）一切都是恒等变换：缩放 1、
+ * 不旋转、没有转盘，和没有这个界面时一模一样。
+ *
+ * There is no permanent tab strip — the wheel carries the session name — so the
  * gesture stays live even at a single tab, alongside the menu's "断开".
  *
  * The terminal's other gestures live here too, because they share the
@@ -152,6 +241,11 @@ fun TerminalTabsPager(
     onCloseTab: (String) -> Unit,
     /** "SFTP 文件管理" in the terminal menu, for the tab with this id. */
     onOpenSftp: (String) -> Unit,
+    /**
+     * 用户在转盘上改了名字：`(tab id, 新名字)`。已 trim，空串 = 清掉自定义名、
+     * 回到原来的名字，由调用方解释。名字只在内存里，不落盘。
+     */
+    onRenameTab: (id: String, name: String) -> Unit = { _, _ -> },
     /**
      * 手势绑定表。有默认值，所以调用点不传也还是改造前的那套手势。
      *
@@ -228,6 +322,10 @@ fun TerminalTabsPager(
 
     // The terminal a long press started selecting in, until a tap ends it.
     var selecting by remember { mutableStateOf<TerminalHandle?>(null) }
+
+    // 正在改名的那条标签，null = 没有对话框。存 id 而不是 index：对话框开着的
+    // 时候那条标签可能被断开，找不到就当没有（见下面的 renaming）。
+    var renamingId by remember { mutableStateOf<String?>(null) }
 
     // Keys go to whichever session is actually on screen, and nowhere at
     // all while the cards are up — a tap there means "pick this terminal",
@@ -352,6 +450,10 @@ fun TerminalTabsPager(
         val p = progress.value
         val scale = 1f - (1f - OPEN_SCALE) * p
 
+        /** 这一页相对分页器中心的有符号偏移：右边的页为负，和 `graphicsLayer` 里用的一致。 */
+        fun pageOffset(page: Int): Float =
+            pagerState.currentPage - page + pagerState.currentPageOffsetFraction
+
         HorizontalPager(
             state = pagerState,
             // The one place the key bar is allowed to cost the terminal rows.
@@ -379,81 +481,123 @@ fun TerminalTabsPager(
             // halfway off-screen when it reopens.
             LaunchedEffect(isOpen) { if (!isOpen) dismissY.snapTo(0f) }
 
-            Box(modifier = Modifier.fillMaxSize()) {
+            // 外层：转盘上的位置。分页器把第 n 页摆在 n×页宽 的地方，这里先用
+            // translationX 把它抵消回屏幕中央（抵消量随进度 p 渐入：刚开始拉的
+            // 时候邻居还在两侧屏幕外，不会叠在当前页上面盖住它），再绕圆心转。
+            // 圆心 = 页面底边再往下 `半径 − 露出高度` 处，用 transformOrigin 的
+            // Y 比例（> 1 就是在页面下方）表达，和 [SessionWheel] 画的圆同心。
+            // rotationZ 为正是顺时针：右边的页（偏移为负）向右倾，和转盘一起转。
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        val offset = pageOffset(page)
+                        val radius = WHEEL_RADIUS_PER_WIDTH * size.width
+                        val centreY = size.height + radius - WheelRise.toPx()
+                        transformOrigin = TransformOrigin(0.5f, if (size.height > 0f) centreY / size.height else 0.5f)
+                        translationX = offset * size.width * p
+                        rotationZ = -offset.coerceIn(-MAX_WHEEL_OFFSET, MAX_WHEEL_OFFSET) *
+                            WHEEL_STEP_DEG * p
+                    },
+            ) {
+                // 中层：卡片本身的缩放（绕自己中心）和抬升，邻居调暗。缩放放在
+                // 这一层而不是只放在里面的终端上，是为了让下面的点击/上划层和
+                // 卡片同大同位：它们是这一层的孩子，命中测试跟着同一个变换走，
+                // 否则一块没缩小的满屏触摸区会盖住旁边的卡片。
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
                             scaleX = scale
                             scaleY = scale
-                            translationY = dismissY.value
-                            // Fade out as it leaves, so a dismissal reads as the
-                            // session going away rather than just scrolling off.
-                            alpha = 1f - (abs(dismissY.value) / size.height).coerceIn(0f, 1f)
-                            shape = RoundedCornerShape((16f * p).dp)
-                            clip = true
+                            translationY = -CardLift.toPx() * p
+                            val away = abs(pageOffset(page)).coerceIn(0f, 1f)
+                            alpha = 1f - (1f - NEIGHBOUR_ALPHA) * away * p
                         },
                 ) {
-                    TerminalScreen(handle = tab.handle)
-                }
-
-                if (isOpen) {
-                    // Swallow everything headed for the WebView while the cards
-                    // are up: in card mode a touch means "pick this terminal",
-                    // not "type into it".
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .pointerInput(page) {
-                                detectTapGestures { chooseAndClose(page) }
-                            }
-                            .pointerInput(tab.id) {
-                                // One finger up = disconnect this session. Down is
-                                // ignored: that direction already means "cancel the
-                                // switcher" via the two-finger gesture, and a card
-                                // that slid downwards would have nowhere to go.
-                                val dismissAt = size.height * DISMISS_FRACTION
-                                detectVerticalDragGestures(
-                                    onVerticalDrag = { change, dragAmount ->
-                                        change.consume()
-                                        scope.launch {
-                                            dismissY.snapTo((dismissY.value + dragAmount).coerceAtMost(0f))
-                                        }
-                                    },
-                                    onDragCancel = { scope.launch { dismissY.animateTo(0f) } },
-                                    onDragEnd = {
-                                        scope.launch {
-                                            if (abs(dismissY.value) > dismissAt) {
-                                                // Finish the throw before tearing the
-                                                // session down, so the card isn't
-                                                // yanked out from under the animation.
-                                                dismissY.animateTo(
-                                                    -size.height.toFloat(),
-                                                    tween(durationMillis = 160),
-                                                )
-                                                onCloseTab(tab.id)
-                                            } else {
-                                                dismissY.animateTo(0f, tween(durationMillis = 180))
-                                            }
-                                        }
-                                    },
-                                )
+                            .graphicsLayer {
+                                translationY = dismissY.value
+                                // Fade out as it leaves, so a dismissal reads as the
+                                // session going away rather than just scrolling off.
+                                alpha = 1f - (abs(dismissY.value) / size.height).coerceIn(0f, 1f)
+                                shape = RoundedCornerShape((20f * p).dp)
+                                clip = true
                             },
-                    )
+                    ) {
+                        TerminalScreen(handle = tab.handle)
+                    }
 
-                    // Every tab onto the same host carries the same name, so
-                    // the label earns its place here in a way it doesn't in
-                    // the tab row.
-                    Text(
-                        text = tab.title,
-                        color = Color.White.copy(alpha = p),
-                        style = MaterialTheme.typography.labelLarge,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 24.dp),
-                    )
+                    if (isOpen) {
+                        // Swallow everything headed for the WebView while the cards
+                        // are up: in card mode a touch means "pick this terminal",
+                        // not "type into it".
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(page) {
+                                    detectTapGestures { chooseAndClose(page) }
+                                }
+                                .pointerInput(tab.id) {
+                                    // One finger up = disconnect this session. Down is
+                                    // ignored: that direction already means "cancel the
+                                    // switcher" via the two-finger gesture, and a card
+                                    // that slid downwards would have nowhere to go.
+                                    //
+                                    // 这一层在缩放后的坐标系里，size 和拖动量都是
+                                    // 缩放前的像素：卡片跟手不用换算（手指走 1px，
+                                    // 这里收到 1/scale，画出来正好又乘回 scale），
+                                    // 但阈值要除以 OPEN_SCALE 才还是「屏幕的 22%」。
+                                    val dismissAt = size.height * DISMISS_FRACTION / OPEN_SCALE
+                                    detectVerticalDragGestures(
+                                        onVerticalDrag = { change, dragAmount ->
+                                            change.consume()
+                                            scope.launch {
+                                                dismissY.snapTo((dismissY.value + dragAmount).coerceAtMost(0f))
+                                            }
+                                        },
+                                        onDragCancel = { scope.launch { dismissY.animateTo(0f) } },
+                                        onDragEnd = {
+                                            scope.launch {
+                                                if (abs(dismissY.value) > dismissAt) {
+                                                    // Finish the throw before tearing the
+                                                    // session down, so the card isn't
+                                                    // yanked out from under the animation.
+                                                    dismissY.animateTo(
+                                                        -size.height.toFloat(),
+                                                        tween(durationMillis = 160),
+                                                    )
+                                                    onCloseTab(tab.id)
+                                                } else {
+                                                    dismissY.animateTo(0f, tween(durationMillis = 180))
+                                                }
+                                            }
+                                        },
+                                    )
+                                },
+                        )
+                    }
                 }
             }
+        }
+
+        // 转盘和会话名：和按键栏一样是分页器的兄弟，属于屏幕而不属于哪一页——
+        // 放进页里的话名字会跟着那张卡片一起转。名字取最靠近中心的那一页
+        // （currentPage 在过半时才翻，不会在甩动中途来回闪），底边留白和分页器
+        // 一致，这样两边算出来的圆心是同一个点。
+        if (isOpen) {
+            val centred = tabs.getOrNull(pagerState.currentPage) ?: tabs[activeIndex]
+            SessionWheel(
+                title = centred.title,
+                pagerState = pagerState,
+                progress = p,
+                onLabelClick = { renamingId = centred.id },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = keyBar.reservedHeight),
+            )
         }
 
         // A sibling of the pager, not a child of it: the bar belongs to the
@@ -474,7 +618,166 @@ fun TerminalTabsPager(
                 onDisconnect = { onCloseTab(tabs[activeIndex].id) },
             )
         }
+
+        // 改名对话框是独立窗口，开着的时候触摸到不了下面的切换器，所以任何手势
+        // 都关不掉它；剩下要防的只有「那条标签在对话框开着时被断开了」，找不到就
+        // 不显示（renamingId 留着也无害，下一次点名字会覆盖它）。
+        val renaming = renamingId?.let { id -> tabs.firstOrNull { it.id == id } }
+        if (renaming != null) {
+            RenameTabDialog(
+                initial = renaming.name,
+                onConfirm = { name ->
+                    renamingId = null
+                    onRenameTab(renaming.id, name.trim())
+                },
+                onDismiss = { renamingId = null },
+            )
+        }
     }
+}
+
+/**
+ * 转盘：屏幕底部露出的一段大圆环（上弧），会话名写在环带最高处，环带上相邻
+ * 两个会话之间各有一条径向刻线。
+ *
+ * 圆心在屏幕底边下方 `半径 − [WheelRise]` 处、水平居中，和每页 `graphicsLayer`
+ * 里的旋转中心是同一个点（两边都按「容器宽度 × [WHEEL_RADIUS_PER_WIDTH]」和
+ * 「容器底边」算，所以调用方要给它和分页器相同的宽和底边留白）。
+ *
+ * 刻线跟着分页器转：第 k 个会话在转盘上的角度是 `k × 步长`，当前位置是
+ * `pos = currentPage + currentPageOffsetFraction`，所以它在屏幕上的角度是
+ * `(k − pos) × 步长`，两个会话之间的刻线就是 `(k + 0.5 − pos) × 步长`——和卡片
+ * 的 `rotationZ` 用的是同一个公式，所以轮子和卡片永远对得上。角度从正上方
+ * 起算，顺时针为正。名字在正上方、不转，所以是画在环带之上的 [Text]。
+ *
+ * 读 `pagerState` 全部放在 Canvas 的绘制块里：每一帧只重绘，不重组。
+ */
+@Composable
+private fun SessionWheel(
+    title: String,
+    pagerState: PagerState,
+    progress: Float,
+    onLabelClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val fill = Color.White.copy(alpha = 0.14f)
+    val line = Color.White.copy(alpha = 0.4f)
+
+    Box(
+        modifier = modifier.graphicsLayer {
+            // 随进度从下面升起并淡入；关着的时候根本不组合它。
+            alpha = progress
+            translationY = (1f - progress) * WheelRise.toPx()
+        },
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val radius = WHEEL_RADIUS_PER_WIDTH * size.width
+            val thickness = WheelRingThickness.toPx()
+            val stroke = 1.5.dp.toPx()
+            val centre = Offset(size.width / 2f, size.height + radius - WheelRise.toPx())
+
+            // 环带填充：一条宽度等于厚度的描边圆，画在中线半径上。
+            drawCircle(fill, radius = radius - thickness / 2f, center = centre, style = Stroke(width = thickness))
+            drawCircle(line, radius = radius, center = centre, style = Stroke(width = stroke))
+            drawCircle(line, radius = radius - thickness, center = centre, style = Stroke(width = stroke))
+
+            val pos = pagerState.currentPage + pagerState.currentPageOffsetFraction
+            val base = floor(pos).toInt()
+            // 屏幕上看得见的只有正负 ~26°，多画几格是给转动留余量。
+            for (k in base - 2..base + 3) {
+                val deg = (k + 0.5f - pos) * WHEEL_STEP_DEG
+                if (abs(deg) > 50f) continue
+                val rad = deg * (PI / 180.0)
+                val dx = sin(rad).toFloat()
+                val dy = -cos(rad).toFloat()
+                drawLine(
+                    color = line,
+                    start = Offset(centre.x + dx * (radius - thickness), centre.y + dy * (radius - thickness)),
+                    end = Offset(centre.x + dx * radius, centre.y + dy * radius),
+                    strokeWidth = stroke,
+                )
+            }
+        }
+
+        // 点击区是整段露出来的拱桥，不只是名字那一块：从底边起 [WheelRise] 高、通栏，
+        // 再用圆环的几何过滤（落点到圆心的距离落在环带内，上下各放宽一点方便手指），
+        // 这样环带以外的卡片、空白仍然不归它管。圆心在这块区域的坐标系里正好是
+        // (宽/2, 半径)：Canvas 里圆心在容器 `高 + 半径 − WheelRise`，而这块区域的
+        // 顶边就在容器 `高 − WheelRise`。
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .height(WheelRise)
+                .pointerInput(progress > 0.5f) {
+                    // 只在基本打开之后响应：拉到一半时它还在往上升、半透明。
+                    if (progress <= 0.5f) return@pointerInput
+                    val radius = WHEEL_RADIUS_PER_WIDTH * size.width
+                    val inner = radius - WheelRingThickness.toPx() - 8.dp.toPx()
+                    val outer = radius + 8.dp.toPx()
+                    detectTapGestures { at ->
+                        val d = hypot(at.x - size.width / 2f, at.y - radius)
+                        if (d in inner..outer) onLabelClick()
+                    }
+                },
+        ) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .height(WheelRingThickness)
+                    .padding(horizontal = 20.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                // Every tab onto the same host carries the same name, so the
+                // label earns its place here in a way it doesn't in the tab
+                // row — and now that it can be renamed, it is how you tell
+                // two of them apart.
+                Text(
+                    text = title,
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 150.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 改名对话框：单行输入框，预填当前名字（不含状态后缀）并全选，方便直接覆盖。
+ * 确认时空白 = 清掉自定义名，由调用方理解（见 `onRenameTab`）。
+ */
+@Composable
+private fun RenameTabDialog(
+    initial: String,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var value by remember { mutableStateOf(TextFieldValue(initial, TextRange(0, initial.length))) }
+    val focus = remember { FocusRequester() }
+    // 对话框一出来就聚焦、弹出键盘。requestFocus 在节点还没挂上时会抛，吞掉：
+    // 最坏的结果是用户多点一下输入框。
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("重命名标签") },
+        text = {
+            OutlinedTextField(
+                value = value,
+                onValueChange = { value = it },
+                singleLine = true,
+                placeholder = { Text("留空恢复默认名称") },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { onConfirm(value.text) }),
+                modifier = Modifier.focusRequester(focus),
+            )
+        },
+        confirmButton = { TextButton(onClick = { onConfirm(value.text) }) { Text("确定") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 /**
