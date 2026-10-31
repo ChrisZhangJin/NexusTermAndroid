@@ -18,6 +18,15 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // 同样是为了 mockable android.jar：`android.util.Log` 的桩会抛
+    // "Method not mocked"，而被测代码在走容错分支时会记一条 warn ——
+    // 于是「存档损坏」这类用例每一条都挂在日志语句上，测不到真正想测的回退
+    // 行为。打开这个开关让桩返回默认值（Log.w 返回 0）而不是抛。
+    // 只作用于 JVM 单测；androidTest 跑在真设备上，用的是真 android.jar。
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     // AGP auto-generates its debug keystore into the *container's* ~/.android/,
     // which is destroyed by every `docker compose up --force-recreate`. A new
     // key means a new signature, which means `adb install -r` fails with
@@ -134,6 +143,13 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
     testImplementation("junit:junit:4.13.2")
+
+    // AGP 给 JVM 单测用的是 "mockable" android.jar —— 里面每个方法体都是
+    // `throw RuntimeException("Method ... not mocked")`。org.json 属于
+    // android.jar，所以 GestureConfig 的序列化/容错逻辑在单测里会当场抛，
+    // 测不了。这个 artifact 是同一套 API 的真实实现，放在测试 classpath 上
+    // 把那个桩盖掉。只影响 test，不进 APK（APK 里用的还是系统自带的那份）。
+    testImplementation("org.json:json:20231013")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
 }

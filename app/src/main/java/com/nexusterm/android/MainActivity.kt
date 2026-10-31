@@ -36,6 +36,10 @@ import com.nexusterm.android.ssh.SessionStore
 import com.nexusterm.android.ssh.SshClient
 import com.nexusterm.android.ui.AuthKind
 import com.nexusterm.android.ui.ConnectScreen
+import com.nexusterm.android.ui.GesturePrefs
+import com.nexusterm.android.ui.GestureSettingsScreen
+import com.nexusterm.android.ui.LiveTabInfo
+import com.nexusterm.android.ui.LiveTabStatus
 import com.nexusterm.android.ui.SessionFormInitial
 import com.nexusterm.android.ui.SessionListScreen
 import com.nexusterm.android.ui.SftpScreen
@@ -125,6 +129,17 @@ private const val SGR_GREEN = "32"
 private enum class LinkState { CONNECTED, RECONNECTING, CLOSED }
 
 /**
+ * [LinkState] 是这个文件的私有实现细节，[LiveTabStatus] 是 UI 层的词汇表。
+ * 保持两套而不是让 SessionListScreen 直接用 LinkState，是为了不让「首页怎么
+ * 画一条活跃标签」这件事反过来把 LiveSession 的内部状态机钉死。
+ */
+private fun LinkState.toTabStatus(): LiveTabStatus = when (this) {
+    LinkState.CONNECTED -> LiveTabStatus.CONNECTED
+    LinkState.RECONNECTING -> LiveTabStatus.RECONNECTING
+    LinkState.CLOSED -> LiveTabStatus.CLOSED
+}
+
+/**
  * One connected-but-not-necessarily-on-screen SSH session. Each live
  * connection owns its own [TerminalHandle]/pending-bytes buffer/close state
  * so switching which tab is active never touches another session's data —
@@ -202,6 +217,13 @@ private class LiveSession(
      */
     var statusSuffix by mutableStateOf("")
 
+    /**
+     * 标签创建的时刻。用 `val` 而不是跟着重连刷新：它标识的是「这条标签」，
+     * 不是底层 SSH 会话——重连换了新会话，用户眼里仍是同一个标签。首页「断开
+     * 哪个标签？」菜单靠它区分同一配置开出的多条标签。
+     */
+    val openedAtMillis: Long = System.currentTimeMillis()
+
     val tabTitle: String get() = displayName + statusSuffix
 }
 
@@ -227,6 +249,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             val navController = rememberNavController()
 
+            // 手势配置放在 NavHost 之上：设置页写、终端页读，必须是同一份状态，
+            // 否则改完设置回到终端还是旧绑定。load 只在首次组合时读一次盘；
+            // 之后的修改走下面 settings 路由里的 onConfigChange（更新 state 并落盘）。
+            var gestureConfig by remember { mutableStateOf(GesturePrefs.load(this@MainActivity)) }
+
             // All currently-connected sessions, regardless of which (if any)
             // is on screen right now — this is what lets the user switch
             // tabs or go back to the session list without tearing the SSH
@@ -244,10 +271,16 @@ class MainActivity : ComponentActivity() {
             var connectError by remember { mutableStateOf<String?>(null) }
 
             /**
-             * The user-initiated close (flick a card up in the switcher).
+             * The user-initiated close：切换器里上划关掉一张卡、首页卡片上的
+             * 「断开」，以及通知栏「全部断开」之后 Rust 回调回来的那条
+             * `on_closed(reason="user")`（见 `onClosedCallback`）。
              * "Gone for good" — dropping the session out of [liveSessions]
              * also disposes its retry effect, so this is simultaneously how
              * auto-reconnect gets cancelled.
+             *
+             * 可以被同一条会话调用两次而不出事（第二次 remove 找不到、
+             * terminal 已经是 null、Rust 的 disconnect 本身幂等），不过真正
+             * 的去重闸门是调用方检查 [LiveSession.disposed]。
              */
             fun disconnectLive(live: LiveSession) {
                 live.disposed = true
@@ -306,7 +339,28 @@ class MainActivity : ComponentActivity() {
                                     // declaring the freshly reconnected session dead.
                                     if (sessionId != live.liveSessionId) return@launch
                                     when (reason) {
-                                        CLOSE_REASON_USER -> Unit
+                                        CLOSE_REASON_USER -> {
+                                            // 「用户主动断开」有两个入口，到这里
+                                            // 时它们的 UI 状态完全不同：
+                                            //
+                                            // 1) 标签上划关闭 / 首页「断开」→ 都走
+                                            //    disconnectLive，UI 已经被同步清过
+                                            //    了，这条回调只是事后通知；
+                                            // 2) 通知栏「全部断开」→ Receiver 绕开
+                                            //    Activity 直接调 Rust 的 disconnect
+                                            //    （它必须这么做：Activity 可能已经
+                                            //    没了，没人能替它执行）。这条回调
+                                            //    是 UI 唯一一次得知这条连接没了的
+                                            //    机会，不清理的话首页会一直亮着
+                                            //    「●」、标签也还在，而底下的 SSH
+                                            //    早断了。
+                                            //
+                                            // 幂等靠 disposed：它只由 disconnectLive
+                                            // 置位，所以「清过」和「没清过」分得干净
+                                            // ——情况 1 直接跳过，不会二次 destroy
+                                            // 已经销毁的 WebView，也不会重复 remove。
+                                            if (!live.disposed) disconnectLive(live)
+                                        }
                                         CLOSE_REASON_LOST -> {
                                             live.state = LinkState.RECONNECTING
                                             live.dropCount++
@@ -402,7 +456,13 @@ class MainActivity : ComponentActivity() {
             LaunchedEffect(Unit) {
                 var askedPermission = false
                 snapshotFlow {
-                    liveSessions.filter { it.state != LinkState.CLOSED }.map { it.state to it.tabTitle }
+                    // liveSessionId 也要带上：通知栏「全部断开」的 PendingIntent
+                    // 靠它知道该断哪些会话。它本身不是 Compose 状态（重连时被
+                    // 直接赋值），所以这里不会因为它变化而重新发射——但重连成功
+                    // 时 state/statusSuffix 必然跟着变，那一次发射读到的就是刚
+                    // 写进去的新 id，通知上的 id 列表因此不会过期。
+                    liveSessions.filter { it.state != LinkState.CLOSED }
+                        .map { Triple(it.state, it.tabTitle, it.liveSessionId) }
                 }.distinctUntilChanged().collect { live ->
                     if (live.isEmpty()) {
                         SessionService.stop(this@MainActivity)
@@ -411,6 +471,7 @@ class MainActivity : ComponentActivity() {
                     SessionService.update(
                         context = this@MainActivity,
                         titles = live.map { it.second },
+                        liveSessionIds = live.map { it.third },
                         reconnecting = live.count { it.first == LinkState.RECONNECTING },
                     )
                     // Asked on the first connect rather than at launch, so the
@@ -458,7 +519,27 @@ class MainActivity : ComponentActivity() {
                                     SessionStore.delete(session.id)
                                     SecretsStore.clear(this@MainActivity, session.id)
                                 },
-                                connectedSessionIds = liveSessions.map { it.savedSessionId }.toSet(),
+                                // 只投影出首页画得到的字段，LiveSession 本体
+                                // （WebView / TerminalHandle）不出这个文件。
+                                liveTabs = liveSessions.map { live ->
+                                    LiveTabInfo(
+                                        tabId = live.tabId,
+                                        savedSessionId = live.savedSessionId,
+                                        title = live.tabTitle,
+                                        status = live.state.toTabStatus(),
+                                        openedAtMillis = live.openedAtMillis,
+                                    )
+                                },
+                                // 首页的「断开」只断用户点中的那一条标签，不是
+                                // 这条配置下的全部——同一个配置可以开好几个标签，
+                                // 一起断掉会误杀另一个正在跑的活。复用上划关闭
+                                // 那条路径（disconnectLive），断开语义全 app 只
+                                // 有一处实现。tabId 可能已经不在表里（用户在菜单
+                                // 开着时让它断了），firstOrNull 直接吞掉。
+                                onDisconnectTab = { tab ->
+                                    liveSessions.firstOrNull { it.tabId == tab.tabId }
+                                        ?.let(::disconnectLive)
+                                },
                                 connectError = connectError,
                                 onConnect = { session ->
                                     // Already connected from this saved session? Jump back into
@@ -479,6 +560,19 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 onNewTab = { session -> connect(session) },
+                                onOpenSettings = { navController.navigate("settings") { launchSingleTop = true } },
+                            )
+                        }
+
+                        composable("settings") {
+                            GestureSettingsScreen(
+                                config = gestureConfig,
+                                onConfigChange = { new ->
+                                    // 先更新 state 再落盘：UI 立刻反映，写盘是 apply() 异步的。
+                                    gestureConfig = new
+                                    GesturePrefs.save(this@MainActivity, new)
+                                },
+                                onBack = { navController.popBackStack() },
                             )
                         }
 
@@ -511,9 +605,10 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 // No tab strip: the switcher's own cards carry the
                                 // session name, so a permanent row would just cost
-                                // vertical space on a phone. It does mean the switcher
-                                // is now the only route to closing a session, which is
-                                // why it stays reachable at a single tab.
+                                // vertical space on a phone. 关闭一条会话现在有三个
+                                // 入口（这里的上划、首页卡片上的「断开」、通知栏的
+                                // 「全部断开」），但从终端界面本身出发仍然只有
+                                // 这一个，所以切换器在只剩一个标签时也要能打开。
                                 //
                                 // `terminal` is non-null for anything that made it into
                                 // `liveSessions` — it's assigned before the session is
@@ -535,6 +630,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                     activeTabId = live.tabId,
+                                    gestureConfig = gestureConfig,
                                     onActiveTabChange = { activeTabId = it },
                                     onCloseTab = { id ->
                                         liveSessions.firstOrNull { it.tabId == id }

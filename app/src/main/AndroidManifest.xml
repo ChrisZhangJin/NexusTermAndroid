@@ -60,6 +60,19 @@
             </intent-filter>
         </activity>
 
+        <!--
+          通知上「全部断开」按钮的接收端。必须在清单里静态注册（而不是
+          Context.registerReceiver）：按钮被按下时 MainActivity 很可能已经
+          销毁，只有清单注册的 receiver 才能被系统拉起来。
+
+          exported="false" + PendingIntent 用的是显式 Intent（直接点名这个
+          类），所以只有本应用能触发它；它一上来就会调 nexus-core 的
+          disconnect，绝不能让别的应用广播得到。
+        -->
+        <receiver
+            android:name=".DisconnectAllReceiver"
+            android:exported="false" />
+
         <service
             android:name=".SessionService"
             android:exported="false"
