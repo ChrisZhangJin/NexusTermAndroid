@@ -1,9 +1,13 @@
 package com.nexusterm.android.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.Build
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.WindowManager
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.compose.animation.core.Animatable
@@ -36,6 +40,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -760,6 +765,19 @@ private fun RenameTabDialog(
     // 对话框一出来就聚焦、弹出键盘。requestFocus 在节点还没挂上时会抛，吞掉：
     // 最坏的结果是用户多点一下输入框。
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+
+    // 键盘一弹，Activity 是 adjustResize，整个窗口会被顶矮，分页器里每页的
+    // WebView 跟着重排，终端的行数变了就会给远端发一次 SSH window-change ——
+    // 只是为了改个名字，把远端的 vim / tmux 重画一遍不值得。对话框开着的这段时间
+    // 把 Activity 窗口临时切成 ADJUST_NOTHING，关掉再还原。对话框自己是独立窗口，
+    // 输入框在屏幕中上部，不会被键盘盖住。
+    val context = LocalContext.current
+    DisposableEffect(context) {
+        val window = context.findActivity()?.window
+        val saved = window?.attributes?.softInputMode
+        window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+        onDispose { if (saved != null) window.setSoftInputMode(saved) }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1697,3 +1715,9 @@ private fun List<PointerInputChange>.centroid(): Offset =
 /** Mean distance of the fingers from [centroid] — what a pinch changes. */
 private fun List<PointerInputChange>.span(centroid: Offset): Float =
     sumOf { (it.position - centroid).getDistance().toDouble() }.toFloat() / size
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
