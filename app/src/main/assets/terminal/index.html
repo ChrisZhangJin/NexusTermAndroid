@@ -194,8 +194,8 @@
   //    the viewport 1:1 with the finger and stops dead on release, which on
   //    a phone means many swipes to get anywhere; this one is SCROLL_GAIN
   //    faster and keeps going with a fling. Anything else (vim, less, tmux
-  //    with the mouse on) is left to xterm, which knows how to turn a drag
-  //    into what that program expects.
+  //    with the mouse on) has no scrollback to move: xterm ignores touch
+  //    there, so the drag is replayed as wheel notches (see wheelDrag).
   //
   // Every drag also feeds the key bar's two facts: that the user is doing
   // something (it hides after a spell of idleness), and an overscroll --
@@ -238,6 +238,29 @@
       term.scrollLines(n);
     }
     return n;
+  }
+
+  // Finger travel per wheel notch, in cell heights. A notch is several lines
+  // to the program (tmux scrolls 5), so this is deliberately coarser than the
+  // 1.6x line-for-line scroll above.
+  var WHEEL_NOTCH_CELLS = 2;
+  var wheelRest = 0;
+
+  /** Feeds a vertical drag to xterm as wheel notches; content follows the finger. */
+  function wheelDrag(x, y) {
+    wheelRest += y - touch.lastY;
+    var step = (cell().height || 17) * WHEEL_NOTCH_CELLS;
+    var n = wheelRest > 0 ? Math.floor(wheelRest / step) : Math.ceil(wheelRest / step);
+    if (!n) return;
+    wheelRest -= n * step;
+    var target = term.element.querySelector(".xterm-screen") || term.element;
+    for (var i = Math.abs(n); i > 0; i--) {
+      target.dispatchEvent(new WheelEvent("wheel", {
+        bubbles: true, cancelable: true, clientX: x, clientY: y,
+        // Finger down = older content = wheel up (negative).
+        deltaY: n > 0 ? -1 : 1, deltaMode: WheelEvent.DOM_DELTA_LINE,
+      }));
+    }
   }
 
   var flingFrame = 0;
@@ -283,6 +306,7 @@
       samples: [{ y: t.clientY, t: performance.now() }],
     };
     scrollRest = 0;
+    wheelRest = 0;
   }, { capture: true, passive: true });
 
   window.addEventListener("touchmove", function (e) {
@@ -319,7 +343,20 @@
       summonRequested = true;
     }
 
-    if (!touch.own) return;
+    if (!touch.own) {
+      // Alternate screen (tmux, vim, less) or mouse tracking on: there is no
+      // scrollback here to move. xterm.js ignores touch in these modes -- its
+      // touch handlers either do nothing (mouse tracking) or scroll a
+      // scrollback that doesn't exist (alternate screen) -- but it does turn a
+      // *wheel* event into what the program wants (mouse wheel reports, or
+      // arrow keys when mouse tracking is off). So a vertical drag is
+      // delivered as wheel notches.
+      e.stopPropagation();
+      if (e.cancelable) e.preventDefault();
+      wheelDrag(x, y);
+      touch.lastY = y;
+      return;
+    }
     e.stopPropagation();
     if (e.cancelable) e.preventDefault();
     var now = performance.now();
