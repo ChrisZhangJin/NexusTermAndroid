@@ -19,6 +19,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -74,6 +75,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -151,6 +153,15 @@ private const val WHEEL_RADIUS_PER_WIDTH = 1.15f
 
 /** 转盘最高点露出屏幕底边多少：环带和标签就住在这一截里。 */
 private val WheelRise = 100.dp
+
+/**
+ * 实际露出多少：竖屏用满 [WheelRise]，横屏屏幕矮，卡片缩小后底边离屏幕底边只剩
+ * `H × (1 − OPEN_SCALE) / 2 + CardLift`，再露 100dp 环带就会盖到卡片上（拱桥压在终端
+ * 最后几行字上）。所以取这段空隙减去一点余量，下限留 56dp 让名字还装得下。
+ * 转盘的圆心和每页的旋转中心都按这个值算，两边必须用同一个函数。
+ */
+private fun wheelRise(containerHeight: Dp): Dp =
+    minOf(WheelRise, containerHeight * ((1f - OPEN_SCALE) / 2f) + CardLift - 8.dp).coerceAtLeast(56.dp)
 
 /** 环带厚度（外圆半径往里数）。标签放在它的中线上，所以要比一行字高得多。 */
 private val WheelRingThickness = 60.dp
@@ -498,7 +509,7 @@ fun TerminalTabsPager(
                     .graphicsLayer {
                         val offset = pageOffset(page)
                         val radius = WHEEL_RADIUS_PER_WIDTH * size.width
-                        val centreY = size.height + radius - WheelRise.toPx()
+                        val centreY = size.height + radius - wheelRise(size.height.toDp()).toPx()
                         transformOrigin = TransformOrigin(0.5f, if (size.height > 0f) centreY / size.height else 0.5f)
                         translationX = offset * size.width * p
                         rotationZ = -offset.coerceIn(-MAX_WHEEL_OFFSET, MAX_WHEEL_OFFSET) *
@@ -668,18 +679,18 @@ private fun SessionWheel(
     val fill = Color.White.copy(alpha = 0.14f)
     val line = Color.White.copy(alpha = 0.4f)
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier.graphicsLayer {
             // 随进度从下面升起并淡入；关着的时候根本不组合它。
             alpha = progress
-            translationY = (1f - progress) * WheelRise.toPx()
+            translationY = (1f - progress) * wheelRise(size.height.toDp()).toPx()
         },
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             val radius = WHEEL_RADIUS_PER_WIDTH * size.width
             val thickness = WheelRingThickness.toPx()
             val stroke = 1.5.dp.toPx()
-            val centre = Offset(size.width / 2f, size.height + radius - WheelRise.toPx())
+            val centre = Offset(size.width / 2f, size.height + radius - wheelRise(size.height.toDp()).toPx())
 
             // 环带填充：一条宽度等于厚度的描边圆，画在中线半径上。
             drawCircle(fill, radius = radius - thickness / 2f, center = centre, style = Stroke(width = thickness))
@@ -713,7 +724,7 @@ private fun SessionWheel(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .height(WheelRise)
+                .height(wheelRise(maxHeight))
                 .pointerInput(progress > 0.5f) {
                     // 只在基本打开之后响应：拉到一半时它还在往上升、半透明。
                     if (progress <= 0.5f) return@pointerInput
