@@ -13,7 +13,7 @@ android {
         minSdk = 26 // WebView byte[]/evaluateJavascript needs API 19+; 26 picked for Compose + modern TLS defaults
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0-slice"
+        versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

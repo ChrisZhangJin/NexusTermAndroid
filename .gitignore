@@ -2,6 +2,8 @@
 /target
 nexus-core/target
 Cargo.lock
+# 应用（cdylib）要锁依赖版本，CI 才能复现本地构建
+!/nexus-core/Cargo.lock
 
 # Android / Gradle
 .gradle/

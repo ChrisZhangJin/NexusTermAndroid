@@ -1,0 +1,84 @@
+name: Build APK
+
+# 推 tag（0.1 或 v0.1 这类）→ 构建 APK 并发布到 GitHub Release；
+# 也可以在 Actions 页面手动跑（workflow_dispatch），只产出 artifact，不发布。
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # 创建 Release 需要
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      NDK_VERSION: "26.1.10909125"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21" # Gradle 8.7 最高支持 Java 21
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-34 build-tools;34.0.0 ndk;${{ env.NDK_VERSION }}"
+
+      # nexus-core 交叉编译到 app/build.gradle.kts 里 cargo { targets } 列出的两个 ABI。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nexus-core
+
+      # 仓库没有 gradlew，直接用指定版本的 Gradle（和 gradle-wrapper.properties 一致）。
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      # 可选：设了 DEBUG_KEYSTORE_BASE64 这个 secret，就用它签名，每次构建的签名一致，
+      # APK 才能互相覆盖安装（沿用 app/build.gradle.kts 里 NEXUSTERM_DEBUG_KEYSTORE 的机制）。
+      # 没设就用 AGP 临时生成的 debug 密钥：每次构建签名都不同，升级需要先卸载。
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/debug.keystore"
+            echo "NEXUSTERM_DEBUG_KEYSTORE=$RUNNER_TEMP/debug.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::notice::DEBUG_KEYSTORE_BASE64 not set; APK is signed with a throwaway debug key"
+          fi
+
+      - name: Unit tests and APK
+        run: gradle --console=plain :app:testDebugUnitTest :app:assembleDebug
+
+      - name: Name the APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/NexusTerm-${GITHUB_REF_NAME//\//-}.apk"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NexusTerm-apk
+          path: dist/*.apk
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
