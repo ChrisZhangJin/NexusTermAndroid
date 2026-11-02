@@ -66,6 +66,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -506,6 +507,9 @@ fun TerminalTabsPager(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    // 层叠顺序：离当前页越近越靠上。默认后面的页盖在前面的页上，
+                    // 右邻居旋转后的角会盖住当前卡片右下角，点那里就选成了邻居。
+                    .zIndex(-abs(page - pagerState.currentPage).toFloat())
                     .graphicsLayer {
                         val offset = pageOffset(page)
                         val radius = WHEEL_RADIUS_PER_WIDTH * size.width
