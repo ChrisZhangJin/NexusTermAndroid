@@ -1,6 +1,8 @@
 package com.nexusterm.android.ssh
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.nexus_core.AuthMethod
 import uniffi.nexus_core.SessionHandle
@@ -69,8 +71,15 @@ object SshClient {
         uniffiProbe(sessionId)
     }
 
-    suspend fun write(sessionId: String, bytes: ByteArray) = withContext(Dispatchers.IO) {
-        uniffiWrite(sessionId, bytes)
+    // 每次按键都是一个独立协程；全都跳到 Dispatchers.IO 的线程池上并发写，先发的可能后到
+    // （快速输入把 "export" 敲成 "expotr"，历史面板的「粘贴 + 回车」让回车跑到粘贴前面）。
+    // 同一会话的写入串行化：Mutex 是 FIFO 公平锁，按调用顺序放行；不同会话互不阻塞。
+    private val writeLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+
+    suspend fun write(sessionId: String, bytes: ByteArray) {
+        writeLocks.getOrPut(sessionId) { Mutex() }.withLock {
+            withContext(Dispatchers.IO) { uniffiWrite(sessionId, bytes) }
+        }
     }
 
     suspend fun resize(sessionId: String, cols: Int, rows: Int) = withContext(Dispatchers.IO) {
