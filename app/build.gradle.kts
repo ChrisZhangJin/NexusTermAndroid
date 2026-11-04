@@ -200,6 +200,15 @@ tasks.whenTaskAdded {
     if (name == "mergeDebugJniLibFolders" || name == "mergeReleaseJniLibFolders") {
         dependsOn("cargoBuild")
     }
+    // 光有顺序不够：上面 dependsOn 只保证 cargo 先跑，不保证合并任务知道 .so 变了。
+    // 实测过 cargo 重编之后 mergeXJniLibFolders / mergeXNativeLibs / stripXDebugSymbols
+    // 仍被判 UP-TO-DATE，APK 装的是旧 .so，启动即 "UniFFI API checksum mismatch"。
+    // 把 cargo 的产物目录显式登记成这三个任务的输入，.so 内容一变就必须重跑。
+    if (Regex("(merge|strip)(Debug|Release)(JniLibFolders|NativeLibs|DebugSymbols)").matches(name)) {
+        inputs.files(fileTree(layout.buildDirectory.dir("rustJniLibs")))
+            .withPropertyName("rustJniLibs")
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+    }
 }
 
 // ─────────────────────── UniFFI Kotlin bindings ───────────────────────
