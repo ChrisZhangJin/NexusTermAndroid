@@ -6,14 +6,20 @@ import android.content.ContextWrapper
 import android.os.Build
 import android.os.SystemClock
 import android.view.InputDevice
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.WindowManager
 import android.webkit.WebView
 import android.widget.Toast
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -45,28 +51,41 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.zIndex
+import com.nexusterm.android.rememberHasHardKeyboard
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -78,7 +97,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.abs
@@ -176,6 +197,18 @@ private val CardLift = 16.dp
 /** 邻居卡片的不透明度；中间那张是 1，按离中心的页距离线性过渡。 */
 private const val NEIGHBOUR_ALPHA = 0.7f
 
+/** 邻居卡片额外再缩小的比例（相对中间那张）：中间一张最大，有「被选中」的层次。 */
+private const val NEIGHBOUR_SHRINK = 0.07f
+
+/** 卡片圆角，随进度从 0 长到这个值。 */
+// 打开弹簧：阻尼比 0.6 约冲过头 10%，刚度 380 一次回弹大约 0.4 秒。
+private const val OPEN_SPRING_DAMPING = 0.6f
+private const val OPEN_SPRING_STIFFNESS = 380f
+private const val CARD_CORNER_DP = 24f
+
+/** 切换器的强调色：当前卡片的描边、转盘的亮边、页点的当前点。取自应用图标的青绿。 */
+private val SwitcherAccent = Color(0xFF4FD1A5)
+
 /**
  * 页偏移的钳位。分页器在快速甩动时会同时拉出更远的页，它们的偏移可以到几页
  * 以外；不钳的话 `offset × 27°` 会把它们转到圆的另一侧去。位置抵消（
@@ -270,6 +303,16 @@ fun TerminalTabsPager(
      * 用户在设置页改完回到终端不会生效。状态归上层持有，这里只负责用。
      */
     gestureConfig: GestureConfig = GestureConfig.DEFAULT,
+    /**
+     * 键盘快捷键「新建标签」：参数是**当前**标签的 id，由调用方找到它的配置、再拨一条
+     * 新连接（不是跳到已有的那条）。没传 = 这个快捷键什么都不做。
+     */
+    onNewTab: (currentTabId: String) -> Unit = {},
+    /**
+     * 物理键盘快捷键的动作入口（见 [ShortcutHost]）。本函数在组合期间把自己登记进去、
+     * 离开组合时注销，所以「终端页在屏幕上」和「快捷键被拦截」严格同步。null = 不接快捷键。
+     */
+    shortcutHost: ShortcutHost? = null,
     modifier: Modifier = Modifier,
 ) {
     if (tabs.isEmpty()) return
@@ -284,7 +327,15 @@ fun TerminalTabsPager(
     val isOpen = progress.value > 0f
 
     suspend fun settle(target: Float) {
-        progress.animateTo(target, tween(durationMillis = 220))
+        // 打开：欠阻尼弹簧，卡片冲过头一点再回弹，这才是看得见的「弹」。
+        // 收起：临界阻尼，不过冲。往 0 以下冲会让 isOpen 在收尾时闪一下，
+        // 还会把整页放大到比全屏更大。
+        val spec = if (target > 0f) {
+            spring<Float>(dampingRatio = OPEN_SPRING_DAMPING, stiffness = OPEN_SPRING_STIFFNESS)
+        } else {
+            spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 520f)
+        }
+        progress.animateTo(target, spec)
     }
 
     /** Commit the carousel's choice and collapse back to a single terminal. */
@@ -344,6 +395,29 @@ fun TerminalTabsPager(
     // 时候那条标签可能被断开，找不到就当没有（见下面的 renaming）。
     var renamingId by remember { mutableStateOf<String?>(null) }
 
+    // 键盘「关闭标签」等待确认的那条标签，null = 没有对话框。同样存 id，理由同上。
+    var closeConfirmId by remember { mutableStateOf<String?>(null) }
+
+    // 终端菜单里「操作说明」对话框开着没有。和上面两个对话框同一个约定：plain remember。
+    // Activity 声明了 configChanges（含 orientation|screenSize），旋转不会重建它，
+    // remember 本来就能活过旋转，没必要用 rememberSaveable。
+    var showHelp by remember { mutableStateOf(false) }
+
+    // 整个终端区域的像素尺寸，只为「终端菜单」快捷键找个锚点（区域中心）。
+    var areaSize by remember { mutableStateOf(IntSize.Zero) }
+
+    // 键盘快捷键切完标签（或关掉切换器）之后，要把按键的去处交还给新的当前终端：
+    // 每 +1 触发一次，见下面的 LaunchedEffect。
+    var hardKeyFocusRequest by remember { mutableIntStateOf(0) }
+
+    // 「新建标签」要等连接建好才有新页面：记下按下时的标签数，数量超过它时再要一次焦点。
+    // -1 = 没有在等。
+    var focusWhenTabsExceed by remember { mutableIntStateOf(-1) }
+
+    // 切换器打开那一刻的当前标签 id：Esc 靠它「关掉但不换标签」。左右方向键转动转盘
+    // 本身就是一次选择（settledPage 那个收集器会采纳），不记下来的话 Esc 就回不去了。
+    var switcherOriginId by remember { mutableStateOf<String?>(null) }
+
     // Keys go to whichever session is actually on screen, and nowhere at
     // all while the cards are up — a tap there means "pick this terminal",
     // not "type into it".
@@ -364,10 +438,223 @@ fun TerminalTabsPager(
         selecting?.selectMove(x / density, y / density)
     }
 
+    /** 把文字放上剪贴板：触摸选择松手和键盘「复制」共用这一处。空串什么都不做。 */
+    fun copyToClipboard(text: String) {
+        if (text.isEmpty()) return
+        clipboard.setText(AnnotatedString(text))
+        // Android 13+ confirms clipboard writes itself.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Toast.makeText(context, "已复制 ${text.length} 个字符", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 把剪贴板里的文字粘进当前终端：手势、菜单、键盘快捷键共用。剪贴板是空的就什么都不做。 */
+    fun pasteFromClipboard() {
+        clipboard.getText()?.text?.takeIf { it.isNotEmpty() }?.let(activeHandle::paste)
+    }
+
+    /** 按键栏的去留只有 summoned 这一个旗标，理由见 `onToggleKeyBar` 处的注释。 */
+    fun toggleKeyBar() {
+        keyBar.summoned = !keyBar.summoned
+        keyBar.noteActivity()
+    }
+
+    // ───────────── 物理键盘快捷键（见 ShortcutHost / Shortcuts.kt） ─────────────
+    //
+    // 下面所有函数都是「手势 / 菜单已经有的那条路」的第二个入口，不另起一套逻辑。
+    // 它们在 Activity.dispatchKeyEvent 里被调用，而不是在组合里，所以读状态一律走
+    // 当前这次组合的闭包 + 下面的 rememberUpdatedState（登记的 handler 永远指向最新
+    // 一次组合里的这几个函数）。
+
+    // 用 rememberUpdatedState 读：focus 的等待协程要在重组之后还看到最新的下标。
+    val activeIndexNow by rememberUpdatedState(activeIndex)
+
+    // 切完标签 / 关掉切换器之后，把按键的去处（WebView 焦点 + xterm 的 textarea）交给
+    // 新的当前终端。WebView 要等「分页器真的落在新标签那一页、切换器收起来」才挂在窗口
+    // 上，所以先等这个条件，再多等一帧让 AndroidView 完成挂载；没挂上去的话
+    // requestFocus 会静默返回 false，按键就没有去处了。只有键盘快捷键会发起这个请求，
+    // 触摸操作不经过这里，所以没有硬键盘的手机不会因此弹出软键盘。
+    LaunchedEffect(hardKeyFocusRequest) {
+        if (hardKeyFocusRequest == 0) return@LaunchedEffect
+        snapshotFlow {
+            pagerState.currentPage == activeIndexNow && !pagerState.isScrollInProgress && progress.value == 0f
+        }.first { it }
+        withFrameNanos { }
+        activeHandle.focusForHardwareKeys()
+    }
+
+    // 物理键盘在不在。键盘是在终端已经在屏幕上之后才插上的话，用户不该还得先点一下终端
+    // 才能打字；所以「变成有键盘」的那一刻、以及页面出现时本来就有键盘，都复用上面那条
+    // 等分页器落定 + 多等一帧的通道（hardKeyFocusRequest），而不是另起一套时序。
+    // 绝不在没有键盘时发起：focusForHardwareKeys 会 requestFocus，会把软键盘弹出来。
+    // 键值是 hasHardKeyboard，所以首次组合（初值就是 true）和 false→true 都会触发一次，
+    // true→false 时 effect 重启但什么都不做。
+    val hasHardKeyboard by rememberHasHardKeyboard()
+    LaunchedEffect(hasHardKeyboard) {
+        if (hasHardKeyboard) hardKeyFocusRequest++
+    }
+
+    LaunchedEffect(tabs.size) {
+        if (focusWhenTabsExceed in 0 until tabs.size) {
+            focusWhenTabsExceed = -1
+            hardKeyFocusRequest++
+        }
+    }
+
+    // 切换器打开的那一刻记下当前标签，见 switcherOriginId。
+    LaunchedEffect(isOpen) { if (isOpen) switcherOriginId = activeTabIdNow }
+
+    /**
+     * 键盘切到第 [page] 个标签。切换器关着：和点标签 / 选卡片一样走 [onActiveTabChange]，
+     * 上面的 LaunchedEffect 负责把分页器无动画地跟过去。切换器开着：只是把转盘转到
+     * 那张卡片，不收起来——滑动转盘本身就是一次选择（settledPage 收集器会采纳），
+     * 之后 Enter / Esc 再决定收起方式。
+     */
+    fun selectPage(page: Int) {
+        if (page !in tabs.indices) return
+        if (progress.value > 0f) {
+            scope.launch { pagerState.animateScrollToPage(page) }
+        } else {
+            hardKeyFocusRequest++
+            onActiveTabChange(tabs[page].id)
+        }
+    }
+
+    /** 字号步进：和捏合一样夹在 MIN..MAX 之间，不同的是每一步都 commit（上报远端窗口尺寸并落盘）。 */
+    fun stepFontSize(delta: Int) {
+        val handle = activeHandle
+        val target = (handle.fontSize + delta).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        if (target != handle.fontSize) handle.setFontSize(target, commit = true)
+    }
+
+    /**
+     * 快捷键动作的实现。返回值的口径见 [ShortcutHost]：终端页在屏幕上时匹配到的键一律
+     * 消费（返回 true），哪怕这次没有东西可做，这样 Ctrl+Shift+W 之类不会漏给远端。
+     */
+    fun performShortcut(action: ShortcutAction): Boolean {
+        // 对话框开着时按键到不了这里（对话框是独立窗口，自己收按键）；万一到了也别动手。
+        if (renamingId != null || closeConfirmId != null || showHelp) return true
+        // 切换器开着时终端本身是被盖住的（手势那边也只在关着的时候识别），所以只有标签类
+        // 动作有意义；其余的吃掉按键、什么都不做。
+        if (progress.value > 0f && action.group != ShortcutGroup.TAB) return true
+
+        when (action) {
+            ShortcutAction.NEXT_TAB, ShortcutAction.PREV_TAB -> {
+                val n = tabs.size
+                if (n > 1) {
+                    val from = if (progress.value > 0f) pagerState.targetPage else activeIndex
+                    val step = if (action == ShortcutAction.NEXT_TAB) 1 else -1
+                    selectPage((from + step + n) % n)
+                }
+            }
+            ShortcutAction.GOTO_TAB_1, ShortcutAction.GOTO_TAB_2, ShortcutAction.GOTO_TAB_3,
+            ShortcutAction.GOTO_TAB_4, ShortcutAction.GOTO_TAB_5, ShortcutAction.GOTO_TAB_6,
+            ShortcutAction.GOTO_TAB_7, ShortcutAction.GOTO_TAB_8, ShortcutAction.GOTO_TAB_9 ->
+                action.tabIndex?.let { selectPage(it) }
+            ShortcutAction.OPEN_SWITCHER -> {
+                // 和 onSwitcherOpen 一样：直接弹到完全打开。已经开着就什么都不做。
+                if (progress.value == 0f) scope.launch { settle(1f) }
+            }
+            ShortcutAction.NEW_TAB -> {
+                // 新连接是异步建起来的：建好之后 tabs 变长，再把按键交给它。
+                // 切换器开着就先收起来，不然新标签出现了，转盘还停在旧卡片上。
+                focusWhenTabsExceed = tabs.size
+                onNewTab(activeTabIdNow)
+                if (progress.value > 0f) scope.launch { settle(0f) }
+            }
+            // 不直接断开：一次按键比一个手势更容易误触，所以走确认对话框。
+            ShortcutAction.CLOSE_TAB -> closeConfirmId = activeTabIdNow
+            ShortcutAction.RENAME_TAB -> renamingId = activeTabIdNow
+            ShortcutAction.COPY -> activeHandle.readSelection { copyToClipboard(it) }
+            ShortcutAction.PASTE -> pasteFromClipboard()
+            ShortcutAction.CLEAR_SCREEN -> activeHandle.clearScreen()
+            ShortcutAction.SCROLL_TO_BOTTOM -> activeHandle.scrollToBottom()
+            ShortcutAction.FONT_SIZE_UP -> stepFontSize(1)
+            ShortcutAction.FONT_SIZE_DOWN -> stepFontSize(-1)
+            ShortcutAction.FONT_SIZE_RESET -> {
+                // 和菜单里的「字体还原」同一个调用；已经是默认字号就不发 JS。
+                if (activeHandle.fontSize != DEFAULT_FONT_SIZE) {
+                    activeHandle.setFontSize(DEFAULT_FONT_SIZE, commit = true)
+                }
+            }
+            // 菜单本来锚在手指落点，键盘没有落点，取终端区域的中心。
+            ShortcutAction.OPEN_MENU ->
+                menuAt = Offset(areaSize.width / 2f, areaSize.height / 2f)
+            ShortcutAction.TOGGLE_KEY_BAR -> toggleKeyBar()
+            // 手势那边拆成开、关两个动作；键盘是一键一次切换，读的是和菜单同一份状态。
+            ShortcutAction.TOGGLE_WIDE_WINDOW -> activeHandle.setVirtualWindow(!activeHandle.virtualWindow)
+            ShortcutAction.OPEN_SFTP -> onOpenSftp(activeTabIdNow)
+        }
+        return true
+    }
+
+    /**
+     * 切换器打开时的按键：左右 = 转盘移到上一张 / 下一张（和左右划一样，不循环），
+     * Enter = 选中并收起（和点中间那张卡片一样），Esc = 收起且不换标签，
+     * Backspace / Delete = 断开选中的那张（和上划是同一个 [onCloseTab]，上划本身
+     * 没有确认，所以这里也没有）。切换器没开返回 false，按键照常走；开着时无修饰键一律吃掉。
+     *
+     * 「选中的那张」取 targetPage 而不是 currentPage：快速连按 → → Enter 时动画还
+     * 没停稳，currentPage 落后一张，targetPage 才是用户按键之后想要的那张。
+     */
+    fun handleSwitcherKey(keyCode: Int): Boolean {
+        // 和 userScrollEnabled 同一个阈值：过半才算「打开了」，收起动画的尾巴不再响应。
+        if (progress.value <= 0.5f) return false
+        if (renamingId != null || closeConfirmId != null || showHelp) return false
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> scope.launch {
+                pagerState.animateScrollToPage((pagerState.targetPage - 1).coerceAtLeast(0))
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> scope.launch {
+                pagerState.animateScrollToPage((pagerState.targetPage + 1).coerceAtMost(tabs.lastIndex))
+            }
+            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> {
+                hardKeyFocusRequest++
+                chooseAndClose(pagerState.targetPage.coerceIn(0, tabs.lastIndex))
+            }
+            KeyEvent.KEYCODE_ESCAPE -> {
+                hardKeyFocusRequest++
+                scope.launch {
+                    val origin = tabs.indexOfFirst { it.id == switcherOriginId }
+                    if (origin >= 0) {
+                        if (pagerState.currentPage != origin) pagerState.animateScrollToPage(origin)
+                        val originId = tabs[origin].id
+                        if (originId != activeTabIdNow) onActiveTabChange(originId)
+                    }
+                    settle(0f)
+                }
+            }
+            KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_FORWARD_DEL ->
+                tabs.getOrNull(pagerState.targetPage)?.let { onCloseTab(it.id) }
+            // 其余无修饰键也吃掉：切换器开着时终端被盖住，漏过去的上下键 / 字母会
+            // 变成远端的历史翻页和输入，用户却只看见卡片。带修饰键的走不到这里。
+            else -> Unit
+        }
+        return true
+    }
+
+    // 把上面两个函数登记给 ShortcutHost。登记的是转调最新一次组合里函数的包装，所以
+    // 不会因为重组而拿着过期的 tabs / 状态；注销时认身份，避免新旧页面交替时的
+    // 「新的先登记、旧的后注销」把新的一并抹掉。
+    val shortcutPerform = rememberUpdatedState<(ShortcutAction) -> Boolean>({ action -> performShortcut(action) })
+    val shortcutSwitcherKey = rememberUpdatedState<(Int) -> Boolean>({ keyCode -> handleSwitcherKey(keyCode) })
+    DisposableEffect(shortcutHost) {
+        val host = shortcutHost ?: return@DisposableEffect onDispose { }
+        val performer: (ShortcutAction) -> Boolean = { action -> shortcutPerform.value(action) }
+        val switcherKeys: (Int) -> Boolean = { keyCode -> shortcutSwitcherKey.value(keyCode) }
+        host.handler = performer
+        host.switcherKeyHandler = switcherKeys
+        onDispose {
+            if (host.handler === performer) host.handler = null
+            if (host.switcherKeyHandler === switcherKeys) host.switcherKeyHandler = null
+        }
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color.Black)
+            .onSizeChanged { areaSize = it }
             .terminalGestures(
                 config = gestureConfig,
                 // Starting a two-finger drag at the very top is Android's
@@ -428,20 +715,11 @@ fun TerminalTabsPager(
                 onSelectEnd = {
                     val handle = selecting
                     selecting = null
-                    handle?.selectEnd { text ->
-                        if (text.isEmpty()) return@selectEnd
-                        clipboard.setText(AnnotatedString(text))
-                        // Android 13+ confirms clipboard writes itself.
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                            Toast.makeText(context, "已复制 ${text.length} 个字符", Toast.LENGTH_SHORT).show()
-                        }
-                    }
+                    handle?.selectEnd { text -> copyToClipboard(text) }
                 },
                 // 下面这几个动作在菜单里本来就有对应项（见 [TerminalMenu]），
                 // 走的是同一条路：手势只是菜单之外的第二个入口，没有另起一套。
-                onPaste = {
-                    clipboard.getText()?.text?.takeIf { it.isNotEmpty() }?.let(activeHandle::paste)
-                },
+                onPaste = { pasteFromClipboard() },
                 onClearScreen = { activeHandle.clearScreen() },
                 onScrollToBottom = { activeHandle.scrollToBottom() },
                 // 状态来源和菜单里「虚拟大窗口」那一项是同一份：
@@ -457,19 +735,33 @@ fun TerminalTabsPager(
                 // 旗标（见 rememberTerminalKeyBarState）。只翻这个旗标、不绕过
                 // 它旁边的那几个条件：页面不在缓冲区底部、或软键盘开着的时候，
                 // 按键栏的去留本来就不归用户的意愿管。
-                onToggleKeyBar = {
-                    keyBar.summoned = !keyBar.summoned
-                    keyBar.noteActivity()
-                },
+                onToggleKeyBar = { toggleKeyBar() },
                 onReplayTap = { at -> replayTap(activeHandle.webView, at) },
             ),
     ) {
-        val p = progress.value
-        val scale = 1f - (1f - OPEN_SCALE) * p
+        // pe 可以冲过 1（打开时的弹簧回弹），只给几何用：缩放、转盘位置、升起。
+        // p 是夹在 0..1 里的那份，给透明度、描边、阴影这类超出范围就会出错的量用。
+        val pe = progress.value
+        val p = pe.coerceIn(0f, 1f)
+        val scale = 1f - (1f - OPEN_SCALE) * pe
 
         /** 这一页相对分页器中心的有符号偏移：右边的页为负，和 `graphicsLayer` 里用的一致。 */
         fun pageOffset(page: Int): Float =
             pagerState.currentPage - page + pagerState.currentPageOffsetFraction
+
+        // 背景幕：切换器打开时把整个屏幕压成一层深色渐变，卡片和转盘才有可以「浮」
+        // 在上面的底。没有它卡片的黑底会和终端的黑底融在一起，只剩一圈轮廓线。
+        // 只画不组合子节点，随进度渐入；关着时（p == 0）什么都不画。
+        if (p > 0f) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(Color(0xFF16222B), Color(0xFF0A0F14), Color(0xFF05070A)),
+                    ),
+                    alpha = p,
+                )
+            }
+        }
 
         HorizontalPager(
             state = pagerState,
@@ -515,9 +807,9 @@ fun TerminalTabsPager(
                         val radius = WHEEL_RADIUS_PER_WIDTH * size.width
                         val centreY = size.height + radius - wheelRise(size.height.toDp()).toPx()
                         transformOrigin = TransformOrigin(0.5f, if (size.height > 0f) centreY / size.height else 0.5f)
-                        translationX = offset * size.width * p
+                        translationX = offset * size.width * pe
                         rotationZ = -offset.coerceIn(-MAX_WHEEL_OFFSET, MAX_WHEEL_OFFSET) *
-                            WHEEL_STEP_DEG * p
+                            WHEEL_STEP_DEG * pe
                     },
             ) {
                 // 中层：卡片本身的缩放（绕自己中心）和抬升，邻居调暗。缩放放在
@@ -528,10 +820,11 @@ fun TerminalTabsPager(
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
-                            translationY = -CardLift.toPx() * p
                             val away = abs(pageOffset(page)).coerceIn(0f, 1f)
+                            val s = scale * (1f - NEIGHBOUR_SHRINK * away * p)
+                            scaleX = s
+                            scaleY = s
+                            translationY = -CardLift.toPx() * pe
                             alpha = 1f - (1f - NEIGHBOUR_ALPHA) * away * p
                         },
                 ) {
@@ -543,11 +836,33 @@ fun TerminalTabsPager(
                                 // Fade out as it leaves, so a dismissal reads as the
                                 // session going away rather than just scrolling off.
                                 alpha = 1f - (abs(dismissY.value) / size.height).coerceIn(0f, 1f)
-                                shape = RoundedCornerShape((20f * p).dp)
+                                shape = RoundedCornerShape((CARD_CORNER_DP * p).dp)
                                 clip = true
+                                // 投影：卡片浮在背景幕上。shadowElevation 画在图层之外，
+                                // 不受 clip 影响；关着时为 0，和没有这个界面时一样。
+                                shadowElevation = 28f * p
+                                ambientShadowColor = Color.Black
+                                spotShadowColor = Color.Black
                             },
                     ) {
                         TerminalScreen(handle = tab.handle)
+                    }
+
+                    // 描边：当前那张是强调色，邻居是淡白。单独一层盖在终端上面，
+                    // 不拦触摸（没有 pointerInput），也不参与测量。
+                    if (p > 0f) {
+                        val away = abs(pageOffset(page)).coerceIn(0f, 1f)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer { translationY = dismissY.value }
+                                .border(
+                                    // 图层被缩到 OPEN_SCALE，所以这里比想要的视觉宽度粗一点。
+                                    width = (1.5f * p).dp,
+                                    color = lerp(SwitcherAccent.copy(alpha = 0.9f), Color.White.copy(alpha = 0.32f), away),
+                                    shape = RoundedCornerShape((CARD_CORNER_DP * p).dp),
+                                ),
+                        )
                     }
 
                     if (isOpen) {
@@ -611,8 +926,9 @@ fun TerminalTabsPager(
             val centred = tabs.getOrNull(pagerState.currentPage) ?: tabs[activeIndex]
             SessionWheel(
                 title = centred.title,
+                count = tabs.size,
                 pagerState = pagerState,
-                progress = p,
+                progress = pe,
                 onLabelClick = { renamingId = centred.id },
                 modifier = Modifier
                     .fillMaxSize()
@@ -633,7 +949,8 @@ fun TerminalTabsPager(
                 anchor = at,
                 handle = activeHandle,
                 onDismiss = { menuAt = null },
-                onPaste = { clipboard.getText()?.text?.takeIf { it.isNotEmpty() }?.let(activeHandle::paste) },
+                onPaste = { pasteFromClipboard() },
+                onShowHelp = { showHelp = true },
                 onOpenSftp = { onOpenSftp(tabs[activeIndex].id) },
                 onDisconnect = { onCloseTab(tabs[activeIndex].id) },
             )
@@ -651,6 +968,36 @@ fun TerminalTabsPager(
                     onRenameTab(renaming.id, name.trim())
                 },
                 onDismiss = { renamingId = null },
+            )
+        }
+
+        // 键盘「关闭标签」的确认。同样找不到（对话框开着时那条标签已经没了）就不显示。
+        val closing = closeConfirmId?.let { id -> tabs.firstOrNull { it.id == id } }
+        if (closing != null) {
+            CloseTabDialog(
+                name = closing.name,
+                onConfirm = {
+                    closeConfirmId = null
+                    onCloseTab(closing.id)
+                },
+                onDismiss = {
+                    closeConfirmId = null
+                    if (hasHardKeyboard) hardKeyFocusRequest++
+                },
+            )
+        }
+
+        // 终端菜单里的「操作说明」。HelpDialog 自己就是 Compose 对话框（独立窗口），
+        // 开着的时候触摸和按键都到不了下面的终端；快捷键表传 gestureConfig.shortcuts，
+        // 这样显示的是用户改绑后的键位。
+        if (showHelp) {
+            HelpDialog(
+                onDismiss = {
+                    showHelp = false
+                    // 对话框拿走过窗口焦点，关掉之后把按键交还给终端；同样只在有键盘时。
+                    if (hasHardKeyboard) hardKeyFocusRequest++
+                },
+                shortcuts = gestureConfig.shortcuts,
             )
         }
     }
@@ -675,18 +1022,18 @@ fun TerminalTabsPager(
 @Composable
 private fun SessionWheel(
     title: String,
+    count: Int,
     pagerState: PagerState,
     progress: Float,
     onLabelClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val fill = Color.White.copy(alpha = 0.14f)
-    val line = Color.White.copy(alpha = 0.4f)
+    val line = Color.White.copy(alpha = 0.16f)
 
     BoxWithConstraints(
         modifier = modifier.graphicsLayer {
             // 随进度从下面升起并淡入；关着的时候根本不组合它。
-            alpha = progress
+            alpha = progress.coerceIn(0f, 1f)
             translationY = (1f - progress) * wheelRise(size.height.toDp()).toPx()
         },
     ) {
@@ -696,10 +1043,20 @@ private fun SessionWheel(
             val stroke = 1.5.dp.toPx()
             val centre = Offset(size.width / 2f, size.height + radius - wheelRise(size.height.toDp()).toPx())
 
-            // 环带填充：一条宽度等于厚度的描边圆，画在中线半径上。
-            drawCircle(fill, radius = radius - thickness / 2f, center = centre, style = Stroke(width = thickness))
-            drawCircle(line, radius = radius, center = centre, style = Stroke(width = stroke))
+            // 环带填充：一条宽度等于厚度的描边圆，画在中线半径上。用纵向渐变（上亮下暗）
+            // 而不是一层平的灰：环带像一块有厚度的玻璃，顶边最亮。渐变范围跟着环带最高点
+            // 到最低可见点，不是整个圆。
+            val top = centre.y - radius
+            val ringBrush = Brush.verticalGradient(
+                colors = listOf(Color(0xFF2A3A45), Color(0xFF141C22)),
+                startY = top,
+                endY = top + thickness * 1.6f,
+            )
+            drawCircle(ringBrush, radius = radius - thickness / 2f, center = centre, style = Stroke(width = thickness))
+            // 内缘一条淡线收边；外缘用强调色，两层叠出一点发光感。
             drawCircle(line, radius = radius - thickness, center = centre, style = Stroke(width = stroke))
+            drawCircle(SwitcherAccent.copy(alpha = 0.22f), radius = radius, center = centre, style = Stroke(width = stroke * 4f))
+            drawCircle(SwitcherAccent.copy(alpha = 0.85f), radius = radius, center = centre, style = Stroke(width = stroke))
 
             val pos = pagerState.currentPage + pagerState.currentPageOffsetFraction
             val base = floor(pos).toInt()
@@ -716,6 +1073,35 @@ private fun SessionWheel(
                     end = Offset(centre.x + dx * radius, centre.y + dy * radius),
                     strokeWidth = stroke,
                 )
+            }
+
+            // 页点：每个会话一个小点，当前的拉长成强调色的胶囊，随转动连续过渡。
+            // 排成水平一行放在环带顶部下方，不沿弧排：沿弧的话边上的点会歪着，
+            // 而名字和它们在视觉上是一组。
+            if (count > 1) {
+                val dotH = 5.dp.toPx()
+                val gap = 8.dp.toPx()
+                val small = 5.dp.toPx()
+                val big = 16.dp.toPx()
+                // 先量总宽再居中；点数很多时只画当前附近的 9 个，免得铺出环带。
+                val first = (pos.roundToInt() - 4).coerceAtLeast(0)
+                val last = (first + 8).coerceAtMost(count - 1)
+                var total = 0f
+                for (k in first..last) total += small + (big - small) * (1f - abs(k - pos).coerceIn(0f, 1f)) + gap
+                total -= gap
+                var x = (size.width - total) / 2f
+                val y = top + 44.dp.toPx()
+                for (k in first..last) {
+                    val near = 1f - abs(k - pos).coerceIn(0f, 1f)
+                    val w = small + (big - small) * near
+                    drawRoundRect(
+                        color = lerp(Color.White.copy(alpha = 0.28f), SwitcherAccent, near),
+                        topLeft = Offset(x, y),
+                        size = Size(w, dotH),
+                        cornerRadius = CornerRadius(dotH / 2f, dotH / 2f),
+                    )
+                    x += w + gap
+                }
             }
         }
 
@@ -744,7 +1130,8 @@ private fun SessionWheel(
             Box(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .height(WheelRingThickness)
+                    // 比环带矮一截：下面留给页点（见 Canvas 里的「页点」）。
+                    .height(WheelRingThickness - 14.dp)
                     .padding(horizontal = 20.dp),
                 contentAlignment = Alignment.Center,
             ) {
@@ -752,14 +1139,18 @@ private fun SessionWheel(
                 // label earns its place here in a way it doesn't in the tab
                 // row — and now that it can be renamed, it is how you tell
                 // two of them apart.
-                Text(
-                    text = title,
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelLarge,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.widthIn(max = 150.dp),
-                )
+                // 换卡片时名字淡入淡出，而不是瞬间跳字。
+                Crossfade(targetState = title, animationSpec = tween(180), label = "wheelTitle") { text ->
+                    Text(
+                        text = text,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 180.dp),
+                    )
+                }
             }
         }
     }
@@ -805,10 +1196,71 @@ private fun RenameTabDialog(
                 placeholder = { Text("留空恢复默认名称") },
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { onConfirm(value.text) }),
-                modifier = Modifier.focusRequester(focus),
+                // Esc 取消（Enter 已经由 ImeAction.Done 走 onConfirm）。放在 focusRequester
+                // 之前：按键预览是从外往里走的，这样焦点在里面的输入框上也收得到。
+                modifier = Modifier
+                    .onPreviewKeyEvent { e ->
+                        if (e.type == KeyEventType.KeyDown && e.key == Key.Escape) {
+                            onDismiss()
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    .focusRequester(focus),
             )
         },
         confirmButton = { TextButton(onClick = { onConfirm(value.text) }) { Text("确定") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+/**
+ * 键盘「关闭标签」的确认对话框：「断开 <name>？」确定 / 取消。
+ *
+ * 一次按键比一个手势更容易误触，所以快捷键不像上划 / 菜单那样直接断开。Enter 确定、
+ * Esc 取消：说明文字是对话框里唯一一个带焦点的非按钮节点，Compose 对话框开出来后
+ * 焦点落在它上面，按键预览在它这里接住；Tab 把焦点移到按钮上之后 Enter 就是按那个
+ * 按钮，不会被这里抢走。
+ */
+@Composable
+private fun CloseTabDialog(
+    name: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val focus = remember { FocusRequester() }
+    // 节点还没挂上时 requestFocus 会抛，吞掉：最坏的结果是 Enter/Esc 不生效，按钮照常能点。
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("断开 $name？") },
+        text = {
+            Text(
+                text = "Enter 确定，Esc 取消",
+                // 顺序：按键预览 → focusRequester → focusable（后两个必须是这个次序）。
+                modifier = Modifier
+                    .onPreviewKeyEvent { e ->
+                        if (e.type != KeyEventType.KeyDown) {
+                            false
+                        } else when (e.key) {
+                            Key.Escape -> {
+                                onDismiss()
+                                true
+                            }
+                            Key.Enter, Key.NumPadEnter -> {
+                                onConfirm()
+                                true
+                            }
+                            else -> false
+                        }
+                    }
+                    .focusRequester(focus)
+                    .focusable(),
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("确定") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }
@@ -825,6 +1277,7 @@ private fun TerminalMenu(
     handle: TerminalHandle,
     onDismiss: () -> Unit,
     onPaste: () -> Unit,
+    onShowHelp: () -> Unit,
     onOpenSftp: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -857,6 +1310,15 @@ private fun TerminalMenu(
                 text = { Text("虚拟大窗口（$VIRTUAL_WINDOW_COLS 列）") },
                 trailingIcon = { if (handle.virtualWindow) Text("✓") },
                 onClick = { onDismiss(); handle.setVirtualWindow(!handle.virtualWindow) },
+            )
+            HorizontalDivider()
+            // 「操作说明」单独成一组，夹在视图类（字体 / 大窗口）和连接类（SFTP / 断开）之间：
+            // 手势和快捷键恰恰是在终端里用的，所以终端菜单里要能直接查到。不放在最末，
+            // 是因为「断开」是破坏性操作、必须留在最底下；帮助紧贴着它的话，手指落点一偏就
+            // 把会话断了。放在这里，下面隔着一条分割线和 SFTP 才轮到「断开」，误点最多是弹个说明。
+            DropdownMenuItem(
+                text = { Text("操作说明") },
+                onClick = { onDismiss(); onShowHelp() },
             )
             HorizontalDivider()
             DropdownMenuItem(

@@ -13,7 +13,9 @@
                    can't grow new methods without touching TerminalScreen.kt,
                    so pulling is the only way those facts reach Kotlin.
                    ...and setFontSize / setVirtualCols / pasteBase64 /
-                   clearScreen / scrollToBottom / select*, driven by the
+                   clearScreen / scrollToBottom / focusForHardwareKeys /
+                   getPromptState (read via result callback) /
+                   select*, driven by the
                    gestures and the two-finger-hold menu in
                    ui/TerminalTabsPager.kt.
     JS -> Kotlin:  window.NexusAndroid.onTermInput(utf8OrBase64String)   // keystrokes
@@ -723,9 +725,51 @@
       return term.getSelection();
     },
 
+    /**
+     * Current selection text, "" when nothing is selected. Unlike selectEnd this
+     * touches no state: it's for the keyboard "copy" shortcut, which acts on
+     * whatever highlight is up (a finished touch selection that xterm hasn't
+     * cleared yet, or one made some other way).
+     */
+    getSelection: function () {
+      return term.hasSelection() ? term.getSelection() : "";
+    },
+
+    /**
+     * Prompt probe for Kotlin's waitForPrompt(): the text of the cursor's line
+     * up to (not including) the cursor, plus the cursor column and the terminal
+     * width, as a JSON string. Same idea as the desktop app's textBeforeCursor()
+     * in termRegistry.ts. Read-only. The line is addressed as baseY + cursorY
+     * (the viewport's offset into the scrollback plus the cursor's row within
+     * the viewport); trimRight=false so the spaces after "$" stay in the text.
+     * Returned as a JSON string rather than an object because
+     * evaluateJavascript hands Kotlin the JSON-encoded result, and a string
+     * keeps the decode identical to getSelection's.
+     */
+    getPromptState: function () {
+      var buf = term.buffer.active;
+      var line = buf.getLine(buf.baseY + buf.cursorY);
+      var text = line ? line.translateToString(false, 0, buf.cursorX) : "";
+      return JSON.stringify({ text: text, cursorX: buf.cursorX, cols: term.cols });
+    },
+
     scrollToBottom: function () {
       stopFling();
       term.scrollToBottom();
+    },
+
+    /**
+     * 物理键盘接着时，让按键直接落进 xterm 的隐藏 textarea。页面刚打开或刚切到
+     * 这个标签时没人点过终端，焦点还在 body 上，按键没有去处。
+     *
+     * 只由 Kotlin 在「确认有物理键盘」时才调：页面加载本身绝不 focus，否则没键盘
+     * 的手机一开页面/一切标签就可能弹软键盘。preventScroll 是为了不触发浏览器
+     * 为「露出」textarea 而滚动文档（虚拟窗口下 #terminal 比屏幕宽，见上面的
+     * scroll 监听）。已经聚焦就什么都不做，避免重复 focus 打断输入法的组词状态。
+     */
+    focusForHardwareKeys: function () {
+      var ta = term.textarea;
+      if (ta && document.activeElement !== ta) ta.focus({ preventScroll: true });
     },
 
     /**

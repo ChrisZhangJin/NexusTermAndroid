@@ -24,6 +24,14 @@ fork，SSH 握手、认证、通道管理、SFTP 子系统这些真正难的部�
 | 凭据存储 | 密码 / 私钥口令写进 Android `EncryptedSharedPreferences`，由 Keystore 托管；**从不**经过 JNI 进入 Rust，也从不落到 SQLite |
 | 多连接 | 同一台主机可以开多条独立会话，各自拥有终端与滚动历史 |
 | 断线自动重连 | 最多 10 次，2s 起逐次翻倍、上限 30s；网络恢复时立刻重试而不是等退避 |
+| 重连后还原现场 | 连接期间每 30s 经旁路通道探测一次远端目录 / tmux 会话；重连成功后自动 `cd` 回去并 `tmux attach`（命令不进 history，回显会被抹掉，终端里留一行「已还原」说明） |
+
+重连还原的边界：
+
+- 还原的是**掉线前最后一次探测**到的目录（最多滞后 30s，刚连上 3s 内掉线则没有数据可还原）。
+- tmux 会话在服务端已不存在时，`tmux attach` 会报错，这是预期行为；还原失败（等不到提示符）时只提示手动命令。
+- docker 只提示「原会话在容器 xxx 中」，**不会**自动重新进入。
+- 探测靠额外开一条 exec 通道；堡垒机若只允许一条通道会拒绝它，此时该配置会被永久标记为「不支持并行通道」，此后不再探测、也不再开旁路通道（也就没有重连还原）。标记存在 `nexusterm_sidecar` SharedPreferences。
 
 ### 终端
 
@@ -68,12 +76,44 @@ fork，SSH 握手、认证、通道管理、SFTP 子系统这些真正难的部�
 - CTRL / ALT 点一下待用（键帽反色），作用于下一个按键 —— 包括软键盘打出的字符 —— 再点一下取消
 - 起点落在键栏上的触摸不会被终端手势抢走
 
+### 外接键盘快捷键
+
+接了物理键盘时，大部分手势都有对应的快捷键（`ui/Shortcuts.kt`）。下表是**出厂键位**；
+「操作说明」里这一节是按当前绑定现场生成的，改绑后会跟着变。
+
+| 分组 | 键位 | 动作 |
+|---|---|---|
+| 标签 | `Ctrl+Tab` | 下一个标签 |
+| | `Ctrl+Shift+Tab` | 上一个标签 |
+| | `Ctrl+Alt+1`…`9` | 直达第 N 个标签 |
+| | `Ctrl+Shift+A` | 会话切换器 |
+| | `Ctrl+Shift+T` | 新建标签（复制当前连接） |
+| | `Ctrl+Shift+W` | 关闭标签（断开连接） |
+| | `Ctrl+Shift+R` | 重命名标签 |
+| 终端 | `Ctrl+Shift+C` | 复制 |
+| | `Ctrl+Shift+V` | 粘贴 |
+| | `Ctrl+Shift+L` | 清屏 |
+| | `Ctrl+Shift+End` | 滑至底部 |
+| 字体 | `Ctrl+=`（也认 `Ctrl+Shift+=`、小键盘 `Ctrl+Num+`） | 字号增大 |
+| | `Ctrl+-`、`Ctrl+Num-` | 字号减小 |
+| | `Ctrl+0`、`Ctrl+Num0` | 字号还原 |
+| 其它 | `Ctrl+Shift+M` | 终端菜单 |
+| | `Ctrl+Shift+K` | 显示 / 隐藏按键栏 |
+| | `Ctrl+Shift+E` | 开关虚拟大窗口 |
+| | `Ctrl+Shift+S` | SFTP 文件管理 |
+
+会话切换器打开时：`←` / `→` 选卡，`Enter` 进入，`Esc` 取消，`Delete` 断开该会话。
+
+- **可以改键**：首页 → 设置 → 手势设置 → 键盘快捷键。
+- **Ctrl+C、Ctrl+Z 等照常发给远端**：`Ctrl+字母`、`Alt+字母` 整族原样交给远端程序（readline、vim、tmux 全靠它们），所以应用级快捷键基本都落在 `Ctrl+Shift+字母` 上——xterm.js 对这一族不产生任何数据，不会和远端抢键。改键时这些保留组合会被拒绝。
+- **Meta+/**：在系统层按 `Meta+/`（Win / Cmd 键 + `/`）会打开 Android 的键盘快捷键面板，里面同样列出这些快捷键。Meta 组合键由系统先行处理，应用本身不绑定。
+
 ### 界面
 
 - 绿色主题，取自图标配色（`ui/theme/Theme.kt` 的 `NexusGreen` / `NexusMint` / `NexusDeep`），
   深浅两套，键栏与页面内的强调色同源
 - 自适应启动图标（background / foreground / monochrome 三层）
-- 会话列表右下角「?」→「操作说明」，列出上面全部手势
+- 会话列表右下角「?」→「操作说明」，列出上面全部手势与外接键盘快捷键
 
 ### 文件
 
@@ -93,8 +133,7 @@ fork，SSH 握手、认证、通道管理、SFTP 子系统这些真正难的部�
 |---|---|
 | 二次验证（keyboard-interactive / 2FA） | `promptUserForAnswer` 直接返回空串，等于取消。连 2FA 主机会快速失败而不是挂住，但**无法登录** |
 | 主机指纹持久化 | `KnownHosts` 是进程内 `HashMap`，重启即忘。首次连接信任（TOFU）只在单次运行内有效 |
-| 重连后的上下文恢复 | 桌面版会探测 cwd / tmux / docker 并在重连后还原。`probe()` 已在 Rust 里，但没导出到 UniFFI，界面也还没做 |
-| 远端资源监控 | 同上，`stats()` 存在但未导出 |
+| 远端资源监控 | `stats()` 在 Rust 里存在但未导出 |
 | ZMODEM（rz / sz） | 未移植 |
 | 端口转发、密钥管理界面、AI 助手 | 未移植 |
 
@@ -160,7 +199,9 @@ app/src/main/
 │   ├── MainActivity.kt          导航图 · 会话生命周期 · 自动重连调度
 │   ├── SessionService.kt       前台服务 · 「N 个会话已连接」常驻通知
 │   ├── ssh/
-│   │   ├── SshClient.kt         connect / write / resize / disconnect 的协程封装
+│   │   ├── SshClient.kt         connect / write / resize / probe / disconnect 的协程封装
+│   │   ├── RemoteContext.kt     探测结果解析 · 重连还原命令（纯 Kotlin，可单测）
+│   │   ├── SidecarPrefs.kt      记录哪些配置的服务器不支持并行通道
 │   │   ├── SftpClient.kt        SFTP 调用封装
 │   │   ├── SessionStore.kt      会话 CRUD（转调 nexus-core）
 │   │   └── SecretsStore.kt      EncryptedSharedPreferences，密码与口令只存这里
@@ -170,7 +211,8 @@ app/src/main/
 │       ├── TerminalScreen.kt    WebView 宿主 + TerminalHandle（终端不归 Compose 所有）
 │       ├── TerminalTabsPager.kt 卡片切换器 + 终端手势识别器 + 终端菜单
 │       ├── TerminalKeyBar.kt    扩展按键行（三页）+ 粘滞修饰键 + 自动隐藏
-│       ├── HelpDialog.kt        操作说明（手势清单，与本文同步）
+│       ├── HelpDialog.kt        操作说明（手势清单，与本文同步；键盘快捷键一节由绑定表生成）
+│       ├── Shortcuts.kt         外接键盘快捷键：动作 · 键位 · 默认绑定 · 保留键位规则
 │       └── SftpScreen.kt        本地（SAF）/ 远端双标签文件浏览
 └── assets/terminal/index.html   xterm.js 宿主页 + Kotlin 双向桥
 

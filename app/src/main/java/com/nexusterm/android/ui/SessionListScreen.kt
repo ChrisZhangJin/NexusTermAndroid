@@ -117,6 +117,8 @@ fun SessionListScreen(
      * 长按）就是被系统抢走、打不开的那个，设置入口藏在里面等于锁在门里。
      */
     onOpenSettings: () -> Unit = {},
+    /** 「操作说明」里键盘快捷键一节按它生成，这样用户改绑之后帮助页不会过时。 */
+    shortcuts: ShortcutBindings = ShortcutBindings.DEFAULT,
 ) {
     var sessions by remember { mutableStateOf<List<SessionRecord>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
@@ -227,7 +229,7 @@ fun SessionListScreen(
     }
 
     if (showHelp) {
-        HelpDialog(onDismiss = { showHelp = false })
+        HelpDialog(onDismiss = { showHelp = false }, shortcuts = shortcuts)
     }
 }
 

@@ -2,6 +2,7 @@ package com.nexusterm.android.ui
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import android.view.ViewGroup
@@ -17,8 +18,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.coroutines.resume
 
 private const val TAG = "NexusTermUI"
 
@@ -99,9 +104,30 @@ class TerminalHandle internal constructor(
             pending.forEach { sendNow(it) }
             pending.clear()
         }
+        if (focusWhenReady) {
+            focusWhenReady = false
+            focusNow()
+        }
     }
 
+    /**
+     * When remote output last arrived, in [SystemClock.elapsedRealtime] ms
+     * (monotonic, unaffected by wall-clock changes; 0 = nothing yet). Callers
+     * of [waitForPrompt] must take their `sinceMs` from the same clock.
+     * Bumped by [writeBase64] only, i.e. by the shell's own bytes; app notices
+     * ([writeNotice]) go through [appendNotice] and deliberately don't count,
+     * or a "reconnected" line would make a silent screen look like fresh output.
+     */
+    @Volatile var lastOutputMs: Long = 0L
+        private set
+
+    /** Shell output from the remote. Use [writeNotice] for app-generated text. */
     fun writeBase64(bytes: ByteArray) {
+        lastOutputMs = SystemClock.elapsedRealtime()
+        appendBytes(bytes)
+    }
+
+    private fun appendBytes(bytes: ByteArray) {
         Log.d(TAG, "writeBase64: ${bytes.size} bytes, pageReady=$pageReady")
         synchronized(pending) {
             if (!pageReady) {
@@ -142,7 +168,7 @@ class TerminalHandle internal constructor(
      * [sgr] is a raw SGR parameter string (33 = yellow, 31 = red, 32 = green).
      */
     fun writeNotice(text: String, sgr: String = "33") {
-        writeBase64("\r\n\u001B[${sgr}m[$text]\u001B[0m\r\n".toByteArray(Charsets.UTF_8))
+        appendBytes("\r\n\u001B[${sgr}m[$text]\u001B[0m\r\n".toByteArray(Charsets.UTF_8))
     }
 
     /**
@@ -192,6 +218,34 @@ class TerminalHandle internal constructor(
     }
 
     /**
+     * 接着物理键盘时，把按键的去处准备好：WebView 拿到 Android 视图焦点，页面里
+     * xterm 的 textarea 拿到 DOM 焦点，两层都到位按键才进得了终端。
+     *
+     * 只能在确认有物理键盘（见 HardKeyboardMonitor）时调，不要在页面加载 / 切标签
+     * 时无条件调：没有硬键盘的手机上，textarea 一聚焦输入法就可能弹出来。
+     * 页面还没跑起来（[markPageReady] 之前）时只记下意图，等页面就绪再补做，否则
+     * `window.NexusTerm` 还不存在，这次调用会被 `&&` 守卫静默吞掉。
+     * WebView 此刻若没挂在窗口上（后台标签）requestFocus 会返回 false，没关系：
+     * 重新挂上之后调用方应再调一次。
+     */
+    fun focusForHardwareKeys() {
+        synchronized(pending) {
+            if (!pageReady) {
+                focusWhenReady = true
+                return
+            }
+        }
+        focusNow()
+    }
+
+    @Volatile private var focusWhenReady = false
+
+    private fun focusNow() {
+        webView.requestFocus()
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.focusForHardwareKeys();", null)
+    }
+
+    /**
      * Touch selection: [selectBegin] selects the word at the point, [selectMove]
      * stretches it out to another. Coordinates are page px, i.e. dp from the
      * WebView's top-left.
@@ -214,6 +268,58 @@ class TerminalHandle internal constructor(
     }
 
     /**
+     * 读出当前选区的文字（没有选区 = ""），不改动任何选区状态——键盘「复制」快捷键用，
+     * 和 [selectEnd] 的区别是它不结束触摸选择。结果的解码和 [selectEnd] 是同一套。
+     */
+    fun readSelection(onText: (String) -> Unit) {
+        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.getSelection() : ''") { raw ->
+            val text = runCatching { JSONArray("[$raw]").optString(0, "") }.getOrDefault("")
+            onText(if (raw == "null") "" else text)
+        }
+    }
+
+    /**
+     * Reads what is on the cursor's line before the cursor (see
+     * NexusTerm.getPromptState in index.html); null when the page isn't up yet
+     * or the result can't be decoded. Safe to call from any thread: the
+     * evaluateJavascript call is posted to the WebView's UI thread.
+     */
+    fun readPromptState(onResult: (PromptState?) -> Unit) {
+        webView.post {
+            webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.getPromptState() : null") { raw ->
+                onResult(parsePromptState(raw))
+            }
+        }
+    }
+
+    /**
+     * Waits for the remote shell to sit at a prompt: output quiet for >350 ms
+     * AND the text before the cursor ends in a prompt character
+     * ([looksLikePrompt]). Returns that [PromptState], or null on timeout
+     * (callers should then not type anything into an uncertain screen).
+     *
+     * [sinceMs] is a [SystemClock.elapsedRealtime] value (same clock as
+     * [lastOutputMs]); at least one remote output chunk must have arrived at or
+     * after it, so a stale prompt left on the screen from before a reconnect
+     * isn't mistaken for the new shell's. Cancellation-cooperative.
+     */
+    suspend fun waitForPrompt(sinceMs: Long, timeoutMs: Long = 10_000): PromptState? {
+        val t0 = SystemClock.elapsedRealtime()
+        while (true) {
+            delay(PROMPT_POLL_MS)
+            val now = SystemClock.elapsedRealtime()
+            val last = lastOutputMs
+            if (last >= sinceMs && now - last > PROMPT_QUIET_MS) {
+                val state = suspendCancellableCoroutine<PromptState?> { cont ->
+                    readPromptState { if (cont.isActive) cont.resume(it) }
+                }
+                if (state != null && looksLikePrompt(state.textBeforeCursor)) return state
+            }
+            if (SystemClock.elapsedRealtime() - t0 > timeoutMs) return null
+        }
+    }
+
+    /**
      * Tears the terminal down for good. Detaches before destroying: a
      * WebView destroyed while still attached to a window logs a hard error
      * and can take the process down, and the Composable showing it is only
@@ -224,6 +330,36 @@ class TerminalHandle internal constructor(
         webView.destroy()
     }
 }
+
+private const val PROMPT_POLL_MS = 150L
+private const val PROMPT_QUIET_MS = 350L
+
+/** Snapshot of the cursor line: [textBeforeCursor] is the line's text up to the cursor. */
+data class PromptState(val textBeforeCursor: String, val cursorX: Int, val cols: Int)
+
+private fun parsePromptState(raw: String?): PromptState? {
+    if (raw == null || raw == "null") return null
+    return runCatching {
+        // evaluateJavascript JSON-encodes the returned string: unwrap the literal first.
+        val json = JSONArray("[$raw]").optString(0, "")
+        val o = JSONObject(json)
+        PromptState(o.optString("text", ""), o.optInt("cursorX", 0), o.optInt("cols", 0))
+    }.getOrNull()
+}
+
+/**
+ * Port of termRegistry.ts's PROMPT_TAIL (desktop app): the line ends in a common
+ * prompt character -- $ # % > or the fancy-prompt glyphs a heavy zsh/starship
+ * theme uses (❯ ➜ » λ) -- optionally followed by one whitespace char (a space, or
+ * U+00A0, which JS's \s covers but Java's doesn't). Only the tail matters, so
+ * `(base) chris@host:~$ `, `# `, `> `, `❯ ` match; `➜  ~ ` (oh-my-zsh
+ * robbyrussell, glyph first and the cwd after it) does not, same as on desktop.
+ */
+private val PROMPT_TAIL = Regex("[$#%>❯➜»λ][\\s\u00A0]?$")
+
+/** True when [textBeforeCursor] (the cursor line up to the cursor) looks like a shell prompt. */
+internal fun looksLikePrompt(textBeforeCursor: String): Boolean =
+    PROMPT_TAIL.containsMatchIn(textBeforeCursor)
 
 /**
  * Builds the WebView + [TerminalHandle] for one live SSH session.

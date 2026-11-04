@@ -1,5 +1,6 @@
 package com.nexusterm.android.ui
 
+import android.view.KeyEvent
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -833,5 +834,111 @@ class GestureConfigTest {
     @Test
     fun defaultRoundTripStillEqualsDefault() {
         assertEquals(GestureConfig.DEFAULT, GestureConfig.fromJson(GestureConfig.DEFAULT.toJson()))
+    }
+
+    // ───────────── v3：物理键盘快捷键（shortcuts 块） ─────────────
+
+    private val customChord = KeyChord(KeyEvent.KEYCODE_J, ctrl = true, shift = true, alt = false)
+
+    @Test
+    fun defaultConfigCarriesDefaultShortcuts() {
+        assertEquals(ShortcutBindings.DEFAULT, GestureConfig.DEFAULT.shortcuts)
+        // 两参构造（既有调用点的写法）仍然得到默认快捷键。
+        assertEquals(ShortcutBindings.DEFAULT, GestureConfig(GestureConfig.DEFAULT.bindings, GestureThresholds()).shortcuts)
+        assertEquals(GestureConfig.DEFAULT, GestureConfig(GestureConfig.DEFAULT.bindings, GestureThresholds()))
+    }
+
+    @Test
+    fun toJsonWritesVersion3AndAShortcutsBlock() {
+        val o = JSONObject(GestureConfig.DEFAULT.toJson())
+        assertEquals(3, o.getInt("v"))
+        val s = o.getJSONObject("shortcuts")
+        ShortcutAction.entries.forEach { assertTrue("${it.name} 没写出", s.has(it.name)) }
+    }
+
+    /** 升级用户的 v2 存档没有 shortcuts：快捷键取默认，手势绑定和阈值原样保留。 */
+    @Test
+    fun v2JsonWithoutShortcutsLoadsWithDefaultShortcutsAndEveryOtherFieldIntact() {
+        val v2 = GestureConfig.DEFAULT
+            .rebind(GestureSlot.TWO_FINGER_HOLD, GestureAction.NONE)
+            .rebind(GestureSlot.THREE_FINGER_HOLD, GestureAction.OPEN_MENU)
+            .copy(thresholds = GestureThresholds(450L, 1200L, 600L, 250L, 400L))
+        // 用当前 toJson 的输出模拟 v2 存档：把版本改回 2 并摘掉 shortcuts 块，其余一字不动。
+        val stored = JSONObject(v2.toJson()).apply {
+            put("v", 2)
+            remove("shortcuts")
+        }.toString()
+        assertFalse(JSONObject(stored).has("shortcuts"))
+
+        val loaded = GestureConfig.fromJson(stored)
+        assertEquals(ShortcutBindings.DEFAULT, loaded.shortcuts)
+        assertEquals(v2, loaded)
+        assertEquals(GestureAction.NONE, loaded.actionFor(GestureSlot.TWO_FINGER_HOLD))
+        assertEquals(GestureAction.OPEN_MENU, loaded.actionFor(GestureSlot.THREE_FINGER_HOLD))
+        assertEquals(v2.thresholds, loaded.thresholds)
+        // 再存一次就是 v3，并且稳定。
+        assertEquals(3, JSONObject(loaded.toJson()).getInt("v"))
+        assertEquals(loaded, GestureConfig.fromJson(loaded.toJson()))
+    }
+
+    @Test
+    fun customShortcutsSurviveConfigRoundTrip() {
+        val saved = GestureConfig.DEFAULT
+            .rebind(GestureSlot.THREE_FINGER_HOLD, GestureAction.OPEN_MENU)
+            .copy(shortcuts = ShortcutBindings.DEFAULT.rebind(ShortcutAction.NEW_TAB, customChord))
+        assertNotEquals(GestureConfig.DEFAULT, saved)
+        val loaded = GestureConfig.fromJson(saved.toJson())
+        assertEquals(saved, loaded)
+        assertEquals(listOf(customChord), loaded.shortcuts.chordsFor(ShortcutAction.NEW_TAB))
+        assertEquals(
+            ShortcutAction.NEW_TAB,
+            loaded.shortcuts.actionFor(KeyEvent.KEYCODE_J, ctrl = true, shift = true, alt = false, meta = false),
+        )
+    }
+
+    /** 设置页靠 == DEFAULT 判断「是否已是默认」：只改快捷键也必须算「不是默认」。 */
+    @Test
+    fun changingOnlyShortcutsMakesTheConfigNonDefault() {
+        val c = GestureConfig.DEFAULT.copy(
+            shortcuts = ShortcutBindings.DEFAULT.rebind(ShortcutAction.COPY, customChord),
+        )
+        assertNotEquals(GestureConfig.DEFAULT, c)
+        // 改回去又相等。
+        assertEquals(GestureConfig.DEFAULT, c.copy(shortcuts = c.shortcuts.reset()))
+    }
+
+    @Test
+    fun shortcutsBlockOfTheWrongTypeGivesDefaultsWithoutTouchingOtherFields() {
+        listOf("\"nope\"", "42", "[1,2]", "null").forEach { bad ->
+            val loaded = GestureConfig.fromJson(
+                """{"v":3,"bindings":{"ONE_FINGER_HOLD":"PASTE"},"shortcuts":$bad}""",
+            )
+            assertEquals(bad, ShortcutBindings.DEFAULT, loaded.shortcuts)
+            assertEquals(bad, GestureAction.PASTE, loaded.actionFor(GestureSlot.ONE_FINGER_HOLD))
+        }
+    }
+
+    /** 逐动作容错：一个动作的数据坏了回默认，同一份存档里别的动作、以及手势部分不受连累。 */
+    @Test
+    fun garbageShortcutEntryOnlyResetsThatAction() {
+        val loaded = GestureConfig.fromJson(
+            """
+            {"v":3,"bindings":{"ONE_FINGER_HOLD":"PASTE"},"shortcuts":{
+              "NEXT_TAB":"oops",
+              "NEW_TAB":[{"key":${KeyEvent.KEYCODE_J},"ctrl":true,"shift":true}]
+            }}
+            """.trimIndent(),
+        )
+        assertEquals(ShortcutBindings.DEFAULT.chordsFor(ShortcutAction.NEXT_TAB), loaded.shortcuts.chordsFor(ShortcutAction.NEXT_TAB))
+        assertEquals(listOf(customChord), loaded.shortcuts.chordsFor(ShortcutAction.NEW_TAB))
+        assertEquals(ShortcutBindings.DEFAULT.chordsFor(ShortcutAction.PASTE), loaded.shortcuts.chordsFor(ShortcutAction.PASTE))
+        assertEquals(GestureAction.PASTE, loaded.actionFor(GestureSlot.ONE_FINGER_HOLD))
+    }
+
+    /** 整份存档坏掉照旧回全默认，快捷键也在其中。 */
+    @Test
+    fun structurallyBrokenJsonAlsoGivesDefaultShortcuts() {
+        assertEquals(ShortcutBindings.DEFAULT, GestureConfig.fromJson("not json").shortcuts)
+        assertEquals(ShortcutBindings.DEFAULT, GestureConfig.fromJson(null).shortcuts)
     }
 }

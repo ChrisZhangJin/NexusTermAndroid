@@ -100,6 +100,9 @@ fun GestureSettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(16.dp),
             )
+
+            // 外接键盘快捷键。放在手势那条收尾说明之后：那句话是讲手势的，不该被它隔开。
+            ShortcutSettingsSection(config = config, onConfigChange = onConfigChange)
         }
     }
 
@@ -107,7 +110,7 @@ fun GestureSettingsScreen(
         AlertDialog(
             onDismissRequest = { confirmReset = false },
             title = { Text("恢复默认手势？") },
-            text = { Text("所有手势绑定和时长都会回到出厂设置。") },
+            text = { Text("所有手势绑定、时长和键盘快捷键都会回到出厂设置。") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmReset = false

@@ -6,7 +6,12 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
+import android.view.KeyboardShortcutGroup
+import android.view.KeyboardShortcutInfo
+import android.view.Menu
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -16,6 +21,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
@@ -33,21 +39,34 @@ import androidx.navigation.navArgument
 import com.nexusterm.android.ssh.SecretsStore
 import com.nexusterm.android.ssh.SessionListenerImpl
 import com.nexusterm.android.ssh.SessionStore
+import com.nexusterm.android.ssh.SidecarPrefs
 import com.nexusterm.android.ssh.SshClient
+import com.nexusterm.android.ssh.TermContext
+import com.nexusterm.android.ssh.cellWidth
+import com.nexusterm.android.ssh.parseProbe
+import com.nexusterm.android.ssh.restoreCommand
+import com.nexusterm.android.ssh.restoreNotice
+import com.nexusterm.android.ssh.stealthInput
 import com.nexusterm.android.ui.AuthKind
 import com.nexusterm.android.ui.ConnectScreen
 import com.nexusterm.android.ui.GesturePrefs
 import com.nexusterm.android.ui.GestureSettingsScreen
+import com.nexusterm.android.ui.KeyChord
 import com.nexusterm.android.ui.LiveTabInfo
 import com.nexusterm.android.ui.LiveTabStatus
 import com.nexusterm.android.ui.SessionFormInitial
 import com.nexusterm.android.ui.SessionListScreen
 import com.nexusterm.android.ui.SftpScreen
+import com.nexusterm.android.ui.ShortcutAction
+import com.nexusterm.android.ui.ShortcutBindings
+import com.nexusterm.android.ui.ShortcutGroup
+import com.nexusterm.android.ui.ShortcutHost
 import com.nexusterm.android.ui.TerminalHandle
 import com.nexusterm.android.ui.TerminalTab
 import com.nexusterm.android.ui.TerminalTabsPager
 import com.nexusterm.android.ui.createTerminal
 import com.nexusterm.android.ui.theme.NexusTermTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -124,6 +143,60 @@ private const val CLOSE_REASON_USER = "user"
 
 private const val SGR_RED = "31"
 private const val SGR_GREEN = "32"
+private const val SGR_YELLOW = "33"
+
+/**
+ * 远端上下文探测节奏：连上 3 秒后探第一次（等 shell 起来、别和登录握手抢），之后每 30 秒一次。
+ * 探测只为「断线时知道用户在哪个目录 / tmux 会话」，30 秒的粒度足够，也不给服务器添负担。
+ */
+private const val PROBE_FIRST_DELAY_MS = 3_000L
+private const val PROBE_INTERVAL_MS = 30_000L
+
+/**
+ * 按住长按时允许「重复触发」的快捷键动作：切标签、调字号这类「按一次一档、按住连续走」
+ * 的动作。其余动作（关闭标签弹确认框、新建标签、打开菜单、粘贴……）必须一次物理按键
+ * 只触发一次，否则按住 Ctrl+Shift+W 会反复弹确认框、按住 Ctrl+Shift+T 会连开标签。
+ */
+private val REPEATABLE_SHORTCUT_ACTIONS: Set<ShortcutAction> = setOf(
+    ShortcutAction.NEXT_TAB,
+    ShortcutAction.PREV_TAB,
+    ShortcutAction.FONT_SIZE_UP,
+    ShortcutAction.FONT_SIZE_DOWN,
+)
+
+/** 会话切换器里按住可以连续触发的键：只有左右方向键（连续翻卡片）；Enter/Esc/Delete 一次按键一次。 */
+private val REPEATABLE_SWITCHER_KEYS: Set<Int> = setOf(
+    KeyEvent.KEYCODE_DPAD_LEFT,
+    KeyEvent.KEYCODE_DPAD_RIGHT,
+)
+
+/**
+ * 一个「在 ACTION_DOWN 上被我们消费掉」的物理键的登记。用来保证：
+ *  - 对应的 ACTION_UP 一定也被吃掉（WebView 不能看到孤儿 key-up），哪怕修饰键已经先松开；
+ *  - 长按产生的重复 DOWN 也被吃掉，而且只有 [repeats] 为 true 时才重新执行动作。
+ *
+ * [action] 非空 = 快捷键动作（长按重复时重新执行同一个动作，不重新按当前修饰键匹配——
+ * 用户可能已经松开了 Ctrl）；为 null = 切换器按键。
+ */
+private class HeldShortcutKey(val action: ShortcutAction?, val repeats: Boolean)
+
+/** 键位 → 系统快捷键面板（[KeyboardShortcutInfo]）要的 META_*_ON 位掩码。Meta 键不在 [KeyChord] 里。 */
+private fun KeyChord.toMetaState(): Int =
+    (if (ctrl) KeyEvent.META_CTRL_ON else 0) or
+        (if (shift) KeyEvent.META_SHIFT_ON else 0) or
+        (if (alt) KeyEvent.META_ALT_ON else 0)
+
+/**
+ * 单纯的修饰键 / 锁定键：永远原样放行，不参与快捷键匹配，否则按住 Ctrl 的瞬间就会
+ * 被当成「某个键位」吃掉，后面的 Ctrl+字母 就坏了。
+ * [KeyEvent.isModifierKey] 管 Shift/Ctrl/Alt/Meta/Sym/Fn，但按文档**不**含 Caps/Num/Scroll Lock，
+ * 所以锁定键单列。
+ */
+private fun isModifierOrLockKey(keyCode: Int): Boolean =
+    KeyEvent.isModifierKey(keyCode) ||
+        keyCode == KeyEvent.KEYCODE_CAPS_LOCK ||
+        keyCode == KeyEvent.KEYCODE_NUM_LOCK ||
+        keyCode == KeyEvent.KEYCODE_SCROLL_LOCK
 
 /** How the UI currently believes a [LiveSession]'s connection is doing. */
 private enum class LinkState { CONNECTED, RECONNECTING, CLOSED }
@@ -210,6 +283,19 @@ private class LiveSession(
     @Volatile var disposed = false
 
     /**
+     * 最近一次成功探测到的远端上下文（目录 / tmux / docker），由 [MainActivity.probeLoop] 写入，
+     * 重连成功后 [MainActivity.restoreContext] 拿**掉线前**的这份去还原现场。探测失败 / 无有用
+     * 信息时保留旧值，所以断线瞬间它仍是掉线前最后一次看到的样子。
+     */
+    @Volatile var ctx: TermContext? = null
+
+    /**
+     * 重连后正在还原现场（等提示符、发 cd / tmux attach）。期间探测既不发也不落盘结果：
+     * 新登录 shell 此刻还在 $HOME，探到它会把掉线前的真实上下文覆盖掉。
+     */
+    @Volatile var restoring = false
+
+    /**
      * Appended to the switcher card's title. Status has to reach the UI
      * through the existing [TerminalTab] shape — `title` is the only free
      * text field it has — so this is a suffix rather than a proper state
@@ -252,6 +338,32 @@ class MainActivity : ComponentActivity() {
      */
     private val retryNudge = MutableStateFlow(0)
 
+    /**
+     * 物理键盘快捷键的动作入口。`Activity.dispatchKeyEvent` 匹配出 [ShortcutAction] 之后调
+     * `shortcutHost.perform(action)`，切换器打开时的方向键 / Enter / Esc / Delete 调
+     * `shortcutHost.onSwitcherKey(keyCode)`。handler 由 `terminal` 路由里的
+     * [TerminalTabsPager] 在组合期间登记、离开时注销（见 [ShortcutHost]），所以首页、
+     * SFTP、设置页上两个调用都返回 false。是 Activity 成员而不是 setContent 里的
+     * remember：dispatchKeyEvent 在组合之外，要够得着它。
+     */
+    val shortcutHost = ShortcutHost()
+
+    /**
+     * 当前生效的快捷键绑定快照。真正的数据源是 Compose 里的 `gestureConfig.shortcuts`
+     * （设置页改绑后会变），但 [dispatchKeyEvent] 在组合之外、读不到 Compose 状态，
+     * 所以 setContent 里用 SideEffect 把它镜像到这里；初始值在 `gestureConfig` 首次读盘
+     * 时同步写入，保证第一次按键之前就是用户存档的键位而不是出厂键位。
+     * `@Volatile`：写在组合线程（主线程）、读在主线程，理论上同线程，加上它只是不依赖这个假设。
+     */
+    @Volatile
+    private var shortcutBindings: ShortcutBindings = ShortcutBindings.DEFAULT
+
+    /**
+     * 已被我们在 ACTION_DOWN 上消费的物理键（keyCode → 登记），见 [HeldShortcutKey]。
+     * 只在主线程（dispatchKeyEvent）里读写，不需要同步。
+     */
+    private val heldShortcutKeys = HashMap<Int, HeldShortcutKey>()
+
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     @OptIn(ExperimentalMaterial3Api::class)
@@ -265,7 +377,14 @@ class MainActivity : ComponentActivity() {
             // 手势配置放在 NavHost 之上：设置页写、终端页读，必须是同一份状态，
             // 否则改完设置回到终端还是旧绑定。load 只在首次组合时读一次盘；
             // 之后的修改走下面 settings 路由里的 onConfigChange（更新 state 并落盘）。
-            var gestureConfig by remember { mutableStateOf(GesturePrefs.load(this@MainActivity)) }
+            var gestureConfig by remember {
+                mutableStateOf(
+                    GesturePrefs.load(this@MainActivity).also { shortcutBindings = it.shortcuts },
+                )
+            }
+            // 把最新的快捷键绑定镜像给 dispatchKeyEvent（它在组合之外）。SideEffect 在每次成功
+            // 重组之后执行，设置页改绑 → gestureConfig 变 → 这里同步，下一次按键就用新键位。
+            SideEffect { shortcutBindings = gestureConfig.shortcuts }
 
             // All currently-connected sessions, regardless of which (if any)
             // is on screen right now — this is what lets the user switch
@@ -405,6 +524,7 @@ class MainActivity : ComponentActivity() {
                             username = session.username,
                             auth = auth,
                             listener = listener,
+                            sidecar = !SidecarPrefs.isDenied(this@MainActivity, session.id),
                         )
                         Log.d(TAG, "connected, sessionId=${handle.sessionId}")
                         live.liveSessionId = handle.sessionId
@@ -517,6 +637,16 @@ class MainActivity : ComponentActivity() {
                             if (drops > 0) reconnectLoop(live)
                         }
                     }
+                    // 远端上下文探测：同样挂在标签上（标签关闭即取消），并以「是否 CONNECTED +
+                    // dropCount」为键——一掉线 collectLatest 立刻取消正在跑的探测，重连成功
+                    // （状态回到 CONNECTED）后从头再来一轮（先等 3 秒再探），探的是新会话。
+                    LaunchedEffect(live.tabId) {
+                        snapshotFlow { (live.state == LinkState.CONNECTED) to live.dropCount }
+                            .distinctUntilChanged()
+                            .collectLatest { (connected, _) ->
+                                if (connected) probeLoop(live)
+                            }
+                    }
                 }
             }
 
@@ -574,6 +704,8 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onNewTab = { session -> connect(session) },
                                 onOpenSettings = { navController.navigate("settings") { launchSingleTop = true } },
+                                // 帮助页的「外接键盘快捷键」要按用户当前（可能已改绑）的键位生成。
+                                shortcuts = gestureConfig.shortcuts,
                             )
                         }
 
@@ -660,6 +792,24 @@ class MainActivity : ComponentActivity() {
                                         liveSessions.firstOrNull { it.tabId == id }?.customName =
                                             name.trim().takeIf { it.isNotEmpty() }
                                     },
+                                    // 键盘「新建标签」：复制当前标签的连接，**另开**一条新的。
+                                    // 和首页「新标签」同一个 connect(session)——它本来就总是拨
+                                    // 新连接，「已连接就跳回去」那段逻辑只在首页的 onConnect 里，
+                                    // 所以这里不需要 forceNew 之类的参数。配置要按 savedSessionId
+                                    // 从库里读出来（LiveSession 只存了 id）；读不到（配置已被
+                                    // 删）就什么都不做，和重连循环对「配置已被删除」的处理一致。
+                                    onNewTab = { tabId ->
+                                        val savedId = liveSessions.firstOrNull { it.tabId == tabId }?.savedSessionId
+                                        if (!savedId.isNullOrBlank()) {
+                                            lifecycleScope.launch {
+                                                val saved = runCatching {
+                                                    SessionStore.list().firstOrNull { it.id == savedId }
+                                                }.getOrNull()
+                                                if (saved != null) connect(saved)
+                                            }
+                                        }
+                                    },
+                                    shortcutHost = shortcutHost,
                                 )
                             }
                         }
@@ -689,6 +839,10 @@ class MainActivity : ComponentActivity() {
     private suspend fun reconnectLoop(live: LiveSession) {
         var seenNudge = retryNudge.value
         var attempt = 1
+        // 掉线前最后一次探测到的上下文，循环一开始就定下来。探测在非 CONNECTED 时不写
+        // live.ctx，这里再取一份快照只是双保险：还原用的永远是「掉线前」的现场，
+        // 不会被重连后新登录 shell 的 $HOME 覆盖。
+        val ctxBeforeDrop = live.ctx
 
         while (attempt <= RECONNECT_MAX) {
             // Re-read the saved session every attempt rather than caching it:
@@ -739,6 +893,8 @@ class MainActivity : ComponentActivity() {
             // *waiting* for it — the connection would still get established,
             // authenticated, and then orphaned with nobody holding its id.
             // Let it finish and hang up explicitly below instead.
+            // 取在拨号之前：waitForPrompt 用它区分「重连前屏幕上残留的旧提示符」和新 shell 的输出。
+            val since = SystemClock.elapsedRealtime()
             val dialed = withContext(NonCancellable) {
                 runCatching {
                     SshClient.connect(
@@ -748,6 +904,7 @@ class MainActivity : ComponentActivity() {
                         username = saved.username,
                         auth = authMethodFor(saved),
                         listener = live.listener!!,
+                        sidecar = !SidecarPrefs.isDenied(this@MainActivity, saved.id),
                     )
                 }
             }
@@ -761,6 +918,9 @@ class MainActivity : ComponentActivity() {
             if (handle != null) {
                 Log.d(TAG, "reconnected tab=${live.tabId} sessionId=${handle.sessionId}")
                 live.liveSessionId = handle.sessionId
+                // 先放开状态再做还原：还原要等提示符（最长 10 秒），不能让标签在这段时间里
+                // 还显示「重连中」。restoring 与 state 同步置位，探测因此不会抢跑。
+                live.restoring = ctxBeforeDrop != null
                 live.state = LinkState.CONNECTED
                 live.statusSuffix = ""
                 live.terminal?.writeNotice("重连成功", SGR_GREEN)
@@ -769,6 +929,9 @@ class MainActivity : ComponentActivity() {
                 // without this the new shell believes it's on a 120-column
                 // terminal for the rest of its life.
                 live.terminal?.refit()
+                // 就在本协程里做（不另开 Job）：再次掉线时 collectLatest 取消整段，还原随之取消，
+                // 不会往已经死掉的会话里写；状态机此时已经是 CONNECTED，没有被它卡住的东西。
+                restoreContext(live, ctxBeforeDrop, since)
                 return
             }
 
@@ -800,6 +963,121 @@ class MainActivity : ComponentActivity() {
             "已重试 $RECONNECT_MAX 次仍未连上，停止自动重连。请关闭此标签后手动重新连接",
             SGR_RED,
         )
+    }
+
+    /**
+     * 每个已连接标签一条的探测循环：先等 [PROBE_FIRST_DELAY_MS]，之后每 [PROBE_INTERVAL_MS]
+     * 经旁路 exec 通道探一次远端 cwd / tmux / 前台进程，结果存进 [LiveSession.ctx]，供掉线重连后
+     * [restoreContext] 还原现场。由 per-tab 的 LaunchedEffect 以 CONNECTED 状态为键驱动，所以
+     * 掉线即被取消、重连成功后重新开始。
+     *
+     * 探测绝不能打扰用户：所有失败都只记 debug 日志、不碰终端、不弹提示。唯一的例外是服务器明确
+     * 拒绝并行通道（堡垒机只允许一条通道）——此时把这个配置记入 [SidecarPrefs]，永远不再探测，
+     * 且之后对它的连接都不再开旁路通道。
+     */
+    private suspend fun probeLoop(live: LiveSession) {
+        delay(PROBE_FIRST_DELAY_MS)
+        while (true) {
+            if (live.disposed || live.state != LinkState.CONNECTED) return
+            if (SidecarPrefs.isDenied(this, live.savedSessionId)) return
+            // 还原现场期间不探（见 LiveSession.restoring），等下一轮。
+            if (!live.restoring) {
+                val sessionId = live.liveSessionId
+                try {
+                    val raw = SshClient.probe(sessionId)
+                    // 结果回来时世界可能已变（掉线 / 重连换了会话 / 开始还原）：不再成立就丢弃。
+                    if (!live.disposed && live.state == LinkState.CONNECTED && !live.restoring &&
+                        sessionId == live.liveSessionId
+                    ) {
+                        parseProbe(raw, System.currentTimeMillis())?.let { live.ctx = it }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 同时看 message 和 Channel 的载荷：生成代码的 message 形如 "v1=..."，
+                    // 文案放在哪个字段上以绑定为准，两处都查最稳。
+                    val text = e.message.orEmpty() + ((e as? SessionException.Channel)?.v1.orEmpty())
+                    when {
+                        text.contains("并行通道") -> {
+                            Log.d(TAG, "服务器不支持并行通道，停止探测 config=${live.savedSessionId}")
+                            SidecarPrefs.markDenied(this, live.savedSessionId)
+                            return
+                        }
+                        // 本连接是在标记之前以 sidecar=true 拨出的另一条标签等情形：旁路没开，探也白探。
+                        text.contains("兼容模式") -> return
+                        else -> Log.d(TAG, "探测失败（忽略） tab=${live.tabId}: ${e.message}")
+                    }
+                }
+            }
+            delay(PROBE_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * 重连成功后还原远端现场：等新 shell 出提示符，然后「悄悄」输入 `cd <目录>; tmux attach -t <会话>`
+     * （前置空格不进 history，并用 [stealthInput] 抹掉回显），再在终端里留一行说明。
+     *
+     * [ctx] 是掉线**之前**的上下文；null（从未探测成功 / 堡垒机关闭了探测）什么都不做。
+     * docker 只提示不重放（见 [restoreCommand]）。取消安全：全程只有可取消的挂起点，
+     * 再次掉线时被 collectLatest 取消，`finally` 负责放开探测。
+     */
+    private suspend fun restoreContext(live: LiveSession, ctx: TermContext?, since: Long) {
+        if (ctx == null) return
+        try {
+            val terminal = live.terminal ?: return
+            val body = restoreCommand(ctx)
+            if (body == null) {
+                // 只剩 docker：没有可执行的还原，只提示。
+                restoreNotice(ctx).forEach { (label, text) ->
+                    terminal.writeNotice("$label：$text", SGR_YELLOW)
+                }
+                return
+            }
+
+            val prompt = terminal.waitForPrompt(since)
+            if (prompt == null) {
+                terminal.writeNotice("未能自动还原目录/会话，请手动执行：$body", SGR_YELLOW)
+                return
+            }
+            // 等提示符期间用户可能关了标签 / 又掉线了：别往不对的会话里写。
+            if (live.disposed || live.state != LinkState.CONNECTED) return
+
+            val input = stealthInput(body, prompt.cursorX, prompt.cols, ::cellWidth)
+            val sentAt = SystemClock.elapsedRealtime()
+            try {
+                SshClient.write(live.liveSessionId, input.toByteArray(Charsets.UTF_8))
+            } catch (e: SessionException) {
+                handleLiveFfiFailure(live, e, "还原目录/会话")
+                return
+            }
+
+            // tmux attach 会切到备用屏幕由 tmux 接管整个画面，这时再往终端里写说明只会变成
+            // 画面上抹不掉的残影；而且 tmux 画面本身就是「已还原」最直观的证明——不写。
+            if (!ctx.tmux.isNullOrEmpty()) return
+
+            // 说明必须等远端把 stealth 序列的回显和「上移 N 行 + 清屏」都画完再写，否则光标
+            // 还没上移，说明先落了地，随后就被那条清屏抹掉。以「发出之后有输出且安静 250ms」为准，
+            // 最多等 3 秒；超时了也照写（多半是命令很慢，说明留在原地总比丢了好）。
+            withTimeoutOrNull(3_000) {
+                while (!(terminal.lastOutputMs >= sentAt &&
+                        SystemClock.elapsedRealtime() - terminal.lastOutputMs > 250)
+                ) {
+                    delay(50)
+                }
+            }
+            if (live.disposed || live.state != LinkState.CONNECTED) return
+
+            val rows = restoreNotice(ctx)
+            val done = rows.filter { it.first != "docker" }
+            if (done.isNotEmpty()) {
+                terminal.writeNotice("已还原：" + done.joinToString(" · ") { "${it.first} ${it.second}" }, SGR_GREEN)
+            }
+            rows.filter { it.first == "docker" }.forEach { (label, text) ->
+                terminal.writeNotice("$label：$text", SGR_YELLOW)
+            }
+        } finally {
+            live.restoring = false
+        }
     }
 
     /**
@@ -894,6 +1172,117 @@ class MainActivity : ComponentActivity() {
             // limit. Neither is worth crashing over.
             Log.w(TAG, "无法监听网络状态，自动重连只能依赖退避定时器", e)
         }
+    }
+
+    /**
+     * 物理键盘快捷键的拦截点。Activity 的 dispatchKeyEvent 是 DecorView 把按键交给焦点
+     * View（WebView / Compose 输入框）**之前**调用的，所以这里能先于终端看到按键。
+     *
+     * ## 消费规则
+     *  - 只处理 ACTION_DOWN / ACTION_UP；ACTION_MULTIPLE、纯修饰键 / 锁定键一律放行。
+     *  - DOWN（repeatCount == 0，即一次新的物理按键）：
+     *      1. 用 [ShortcutBindings.actionFor] 匹配键位，命中且 `shortcutHost.perform` 返回 true
+     *         → 消费，并把这个 keyCode 登记进 [heldShortcutKeys]；
+     *      2. 否则，如果没有任何修饰键，问切换器 `shortcutHost.onSwitcherKey`，返回 true → 消费并登记；
+     *      3. 否则放行（Ctrl+C / Ctrl+Z / Ctrl+字母 / Alt+字母 / Tab / 方向键……原样给终端）。
+     *  - DOWN（repeatCount > 0，长按重复）：**不重新匹配键位**。登记过 = 这次物理按键起手
+     *    就被我们吃了，重复也吃；其中只有 [REPEATABLE_SHORTCUT_ACTIONS]（切标签、字号加减）
+     *    和切换器的左右方向键会重新执行，其它动作一次物理按键只触发一次。没登记过 = 放行
+     *    （比如先按住 A 再按 Ctrl，A 的重复事件不能变成快捷键）。
+     *  - UP：登记过就消费并注销（哪怕 Ctrl 已经先松开了），WebView 永远不会看到孤儿 key-up；
+     *    没登记过就放行。
+     *  - 起手 DOWN 没被消费时顺手清掉同 keyCode 的旧登记，防止应用失焦时丢了 UP 留下陈旧
+     *    条目、误吃以后一次正常按键的 UP。
+     *
+     * 不要求 `isHardwareKeyEvent(event)`：adb 注入的事件可能报告虚拟/空设备
+     * （见 HardKeyboardMonitor 里的说明），要求它会让 `adb shell input keycombination` 测不了。
+     *
+     * ## 已知风险
+     * 部分布局（如德语）里 AltGr 会以 Ctrl+Alt 的形式到达，于是默认的 Ctrl+Alt+数字
+     * （直达第 n 个标签）可能和 AltGr+数字 打出的字符（如 `{` `[` `]` `}`）撞车。键位在
+     * 设置页里可以改绑，这里不做特殊处理。
+     *
+     * 终端页不在屏幕上时 shortcutHost 的两个 handler 都是 null，perform / onSwitcherKey 都返回
+     * false，于是首页、SFTP、设置页（含文本框）的按键处理完全不受影响。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val type = event.action
+        val keyCode = event.keyCode
+        if ((type != KeyEvent.ACTION_DOWN && type != KeyEvent.ACTION_UP) || isModifierOrLockKey(keyCode)) {
+            return super.dispatchKeyEvent(event)
+        }
+
+        // UP：起手被我们吃掉的，UP 也必须吃掉；不看当前修饰键状态。
+        if (type == KeyEvent.ACTION_UP) {
+            return if (heldShortcutKeys.remove(keyCode) != null) true else super.dispatchKeyEvent(event)
+        }
+
+        // DOWN 的长按重复：只看起手时的登记，不重新匹配。
+        if (event.repeatCount > 0) {
+            val held = heldShortcutKeys[keyCode] ?: return super.dispatchKeyEvent(event)
+            if (held.repeats) {
+                val action = held.action
+                if (action != null) shortcutHost.perform(action) else shortcutHost.onSwitcherKey(keyCode)
+            }
+            return true
+        }
+
+        // 一次新的物理按键。
+        heldShortcutKeys.remove(keyCode)
+
+        val ctrl = event.isCtrlPressed
+        val shift = event.isShiftPressed
+        val alt = event.isAltPressed
+        val meta = event.isMetaPressed
+
+        val action = shortcutBindings.actionFor(keyCode, ctrl, shift, alt, meta)
+        if (action != null && shortcutHost.perform(action)) {
+            heldShortcutKeys[keyCode] = HeldShortcutKey(action, action in REPEATABLE_SHORTCUT_ACTIONS)
+            return true
+        }
+
+        // 会话切换器打开时它自己认的键（左右 / Enter / Esc / Delete）；切换器没开时返回 false，
+        // 普通的方向键、Enter、Esc 照常到终端。只在无修饰键时问，Ctrl+方向键等属于远端程序。
+        if (!ctrl && !shift && !alt && !meta && shortcutHost.onSwitcherKey(keyCode)) {
+            heldShortcutKeys[keyCode] = HeldShortcutKey(null, keyCode in REPEATABLE_SWITCHER_KEYS)
+            return true
+        }
+
+        return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * Meta+/ 打开的系统「键盘快捷键」面板的内容来源。面板**只是展示**：系统不会替我们派发
+     * 面板里列的组合键，真正生效的是上面的 [dispatchKeyEvent]；所以这里列的必须和
+     * [shortcutBindings]（含用户改绑）保持一致，由它现场生成，而不是写死一张表。
+     *
+     * 每个 [ShortcutGroup] 一组；未绑定的动作跳过；GOTO_TAB_1..9 折叠成一行
+     * 「直达第 N 个标签（数字键 1–9）」，取 GOTO_TAB_1 的第一个键位当代表（九个键位
+     * 只差最后的数字，列九行没有信息量）。
+     */
+    override fun onProvideKeyboardShortcuts(
+        data: MutableList<KeyboardShortcutGroup>,
+        menu: Menu?,
+        deviceId: Int,
+    ) {
+        val bindings = shortcutBindings
+        for (group in ShortcutGroup.entries) {
+            val infos = ArrayList<KeyboardShortcutInfo>()
+            for (action in ShortcutAction.inGroup(group)) {
+                if (action.tabIndex != null) {
+                    // GOTO_TAB_n 只在 n == 1 处出一行，其余跳过。
+                    if (action != ShortcutAction.GOTO_TAB_1) continue
+                    val chord = bindings.chordsFor(action).firstOrNull() ?: continue
+                    infos += KeyboardShortcutInfo("直达第 N 个标签（数字键 1–9）", chord.keyCode, chord.toMetaState())
+                    continue
+                }
+                for (chord in bindings.chordsFor(action)) {
+                    infos += KeyboardShortcutInfo(action.label, chord.keyCode, chord.toMetaState())
+                }
+            }
+            if (infos.isNotEmpty()) data += KeyboardShortcutGroup(group.label, infos)
+        }
+        super.onProvideKeyboardShortcuts(data, menu, deviceId)
     }
 
     override fun onDestroy() {

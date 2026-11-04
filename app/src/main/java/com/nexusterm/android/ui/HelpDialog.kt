@@ -8,7 +8,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import android.view.KeyEvent
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -46,17 +48,95 @@ private val HELP_SECTIONS = listOf(
 )
 
 /**
+ * 以此开头的行是分段内的小标题（不加「• 」、加粗显示），不是 bullet。用一个前缀约定而不是
+ * 另起一个数据类型，是为了让 [HELP_SECTIONS] 保持「标题 → 文字行」这个一眼能对照的形状。
+ */
+private const val SUBHEADER_PREFIX = "## "
+
+/**
+ * 「外接键盘快捷键」一节。键位**不写死**，由 [shortcuts] 现场生成：用户在设置里改绑之后，
+ * 帮助页必须跟着变，否则这份说明比没有还糟（照着它按不出效果）。所以它不能像
+ * [HELP_SECTIONS] 那样是顶层常量，而是 [shortcuts] 的函数。
+ *
+ * 分组、顺序、文字全部来自 [ShortcutAction] / [ShortcutGroup]，新增动作不用改这里。
+ * 未绑定的动作直接略去（帮助页列一个按不出来的「未设置」没有意义）。
+ *
+ * 不论当前有没有接键盘都照常显示：用户是在接键盘**之前**来翻帮助的。
+ */
+private fun keyboardShortcutSection(shortcuts: ShortcutBindings): Pair<String, List<String>> {
+    val lines = mutableListOf("大部分手势都有对应的键盘操作，下面是当前的键位")
+
+    ShortcutGroup.entries.forEach { group ->
+        val groupLines = mutableListOf<String>()
+        ShortcutAction.inGroup(group).forEach { action ->
+            if (action.tabIndex != null) {
+                // GOTO_TAB_1..9 合并成一行放在 GOTO_TAB_1 的位置，其余 2..9 在下面被吞掉。
+                if (action.tabIndex == 0) {
+                    val merged = gotoTabLine(shortcuts)
+                    if (merged != null) {
+                        groupLines += merged
+                        return@forEach
+                    }
+                } else if (gotoTabLine(shortcuts) != null) {
+                    return@forEach
+                }
+                // 合并不了（用户改绑过）就落回通用路径，每个动作各占一行，保证不漏不错。
+            }
+            if (shortcuts.chordsFor(action).isEmpty()) return@forEach
+            groupLines += "${shortcuts.describe(action)}：${action.label}"
+        }
+        if (groupLines.isNotEmpty()) {
+            lines += SUBHEADER_PREFIX + group.label
+            lines += groupLines
+        }
+    }
+
+    // 下面几条是固定文字，不来自绑定表：它们描述的是行为约定，不随改绑变化。
+    lines += SUBHEADER_PREFIX + "其它说明"
+    lines += "会话切换器打开时：←/→ 选卡，Enter 进入，Esc 取消，Delete 断开该会话"
+    lines += "Ctrl+C、Ctrl+Z、Ctrl+字母和 Alt+字母原样发给远端，不会被应用占用"
+    lines += "在系统层 Meta+/ 可以打开 Android 的键盘快捷键面板，里面同样列出这些快捷键"
+    lines += "快捷键可在 首页 → 设置 → 手势设置 → 键盘快捷键 里修改"
+    return "外接键盘快捷键" to lines
+}
+
+/**
+ * 「切换到标签 1..9」合并成一行，如「Ctrl+Alt+1…9：直达第 N 个标签」。
+ *
+ * 只有在九个动作**各自恰好一个键位、修饰键相同、主键正好是数字 1..9**时才合并 ——
+ * 这是默认键位的形状（Ctrl+Alt+数字）。用户把其中任何一个改绑、解绑或加了别名，
+ * 「…1–9」这个写法就不再成立，返回 null 让调用方逐条列出真实键位，宁可啰嗦也不能错。
+ */
+private fun gotoTabLine(shortcuts: ShortcutBindings): String? {
+    val first = shortcuts.chordsFor(ShortcutAction.GOTO_TAB_1).singleOrNull() ?: return null
+    if (first.keyCode != KeyEvent.KEYCODE_1) return null
+    for (index in 1..8) {
+        val action = ShortcutAction.forTabIndex(index) ?: return null
+        val chord = shortcuts.chordsFor(action).singleOrNull() ?: return null
+        if (chord != first.copy(keyCode = KeyEvent.KEYCODE_1 + index)) return null
+    }
+    // describe() 以主键名结尾，数字键的名字就是 "1"，去掉它得到修饰键前缀（"Ctrl+Alt+"）。
+    return "${first.describe().removeSuffix("1")}1…9：直达第 N 个标签"
+}
+
+/**
  * The "?" button's 操作说明: almost every terminal interaction is a gesture
  * with no on-screen affordance, so this is the only place they are discoverable.
+ *
+ * 所有输入都走参数、不依赖 SessionListScreen，终端内的帮助入口也可以直接复用。
+ * [shortcuts] 默认是出厂键位，只是为了让不关心键盘的调用方照常编译；真正的调用方
+ * 应传 `gestureConfig.shortcuts`，帮助页才会显示用户改绑后的键位。
  */
 @Composable
-fun HelpDialog(onDismiss: () -> Unit) {
+fun HelpDialog(onDismiss: () -> Unit, shortcuts: ShortcutBindings = ShortcutBindings.DEFAULT) {
+    // 键位表不变就不重算：对话框每次重组都重新拼几十行字符串没有必要。
+    val sections = remember(shortcuts) { HELP_SECTIONS + keyboardShortcutSection(shortcuts) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("操作说明") },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                HELP_SECTIONS.forEachIndexed { index, (header, lines) ->
+                sections.forEachIndexed { index, (header, lines) ->
                     Text(
                         text = header,
                         style = MaterialTheme.typography.titleSmall,
@@ -64,11 +144,20 @@ fun HelpDialog(onDismiss: () -> Unit) {
                         modifier = Modifier.padding(top = if (index == 0) 0.dp else 12.dp, bottom = 4.dp),
                     )
                     lines.forEach { line ->
-                        Text(
-                            text = "• $line",
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.padding(bottom = 2.dp),
-                        )
+                        if (line.startsWith(SUBHEADER_PREFIX)) {
+                            Text(
+                                text = line.removePrefix(SUBHEADER_PREFIX),
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                            )
+                        } else {
+                            Text(
+                                text = "• $line",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.padding(bottom = 2.dp),
+                            )
+                        }
                     }
                 }
             }

@@ -188,6 +188,13 @@ pub fn delete_session(id: String) -> Result<(), StoreError> {
 /// [`ssh::session::SharedConns`] 之后，同一配置的文件面板就能复用这条已认证连接
 /// 开 sftp 子系统，省掉一次握手和一次验证码——没有它，`sftp_connect` 永远只能
 /// 独立拨号。
+///
+/// `sidecar` 决定本连接是否允许 app 另开旁路 exec 通道（`probe` 用它探测
+/// 远端 pwd / tmux / 前台进程）。为 `true` 时 [`probe`] 可用；但只允许一条
+/// 通道的堡垒机会拒绝第二条 CHANNEL_OPEN，甚至直接掐断整条连接——被拒时
+/// 错误文案包含 `ssh::session::SIDECAR_DENIED`，调用方据此为该配置改传
+/// `false`。为 `false` 时一条额外通道都不开，`probe` 直接返回含
+/// `SIDECAR_OFF` 的错误。所以调用方必须能把它关掉。
 #[uniffi::export]
 pub fn connect(
     config_id: String,
@@ -196,6 +203,7 @@ pub fn connect(
     username: String,
     auth: AuthMethod,
     listener: Box<dyn TerminalEventListener>,
+    sidecar: bool,
 ) -> Result<SessionHandle, SshError> {
     let listener: Arc<dyn TerminalEventListener> = Arc::from(listener);
     let id = new_session_id();
@@ -209,7 +217,7 @@ pub fn connect(
         connect_timeout_secs: None,
         legacy_crypto: None,
         config_id: Some(config_id),
-        sidecar: Some(false),
+        sidecar: Some(sidecar),
     };
 
     let outcome = runtime().block_on(manager().connect(listener, id.clone(), req))?;
@@ -231,6 +239,17 @@ pub fn write(session_id: String, bytes: Vec<u8>) -> Result<(), SshError> {
 #[uniffi::export]
 pub fn resize(session_id: String, cols: u16, rows: u16) -> Result<(), SshError> {
     manager().resize(&session_id, cols, rows)
+}
+
+/// 探测该会话交互 shell 的远端上下文（`cwd` / 前台进程 / tmux 会话等 `k=v`，
+/// 键由 `ssh::session::PROBE_SCRIPT` 决定，空值不返回）。
+///
+/// 走旁路 exec 通道，需要 `connect(.., sidecar = true)`。失败时 `SshError::Channel`
+/// 的文本里带有 `SIDECAR_DENIED`（服务端拒绝并行通道）或 `SIDECAR_OFF`（本连接
+/// 已关闭旁路）；会话不存在则是 `SshError::NotFound`。
+#[uniffi::export]
+pub fn probe(session_id: String) -> Result<std::collections::HashMap<String, String>, SshError> {
+    runtime().block_on(manager().probe(&session_id))
 }
 
 /// 主动断开。幂等：会话已经不存在也不报错——对应用户快速点两下「断开」

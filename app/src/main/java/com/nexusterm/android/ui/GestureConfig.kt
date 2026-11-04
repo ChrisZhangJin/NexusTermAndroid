@@ -398,10 +398,17 @@ fun defaultActionFor(slot: GestureSlot): GestureAction =
  * 的构造路径（[DEFAULT] 和 [fromJson]）都产出键集完整的 map，`==` 才能当「语义
  * 相等」用。手搓残缺 map 的实例不保证这一点 —— 想比就先 `GestureConfig(
  * GestureSlot.entries.associateWith(it::actionFor), it.thresholds)` 补全。
+ *
+ * [shortcuts] 是外接物理键盘的快捷键绑定（见 Shortcuts.kt），**搭这份配置的便车**
+ * 一起持久化：MainActivity 存的就是整份 GestureConfig、设置页编辑的也是它，快捷键
+ * 不用另开一套接线。代价是「恢复默认」（`config == DEFAULT` 才置灰、重置也是整份重置）
+ * 会连快捷键一起算 —— 对「恢复默认」这个按钮来说这恰好是预期。它放在最后并带默认值，
+ * 所以所有既有的两参构造 / copy 调用点不受影响。
  */
 data class GestureConfig(
     val bindings: Map<GestureSlot, GestureAction> = DEFAULT_BINDINGS,
     val thresholds: GestureThresholds = GestureThresholds(),
+    val shortcuts: ShortcutBindings = ShortcutBindings.DEFAULT,
 ) {
     /** [slot] 当前绑定的动作。缺失或非法组合都回退到 [defaultActionFor]。 */
     fun actionFor(slot: GestureSlot): GestureAction =
@@ -453,6 +460,7 @@ data class GestureConfig(
             put(KEY_ONE_FINGER_DOUBLE_TAP_WINDOW_MS, thresholds.oneFingerDoubleTapWindowMs)
             put(KEY_TWO_FINGER_DOUBLE_TAP_WINDOW_MS, thresholds.twoFingerDoubleTapWindowMs)
         })
+        put(KEY_SHORTCUTS, shortcuts.toJsonObject())
     }.toString()
 
     companion object {
@@ -503,6 +511,7 @@ data class GestureConfig(
             // 版本号只写不分支：逐字段容错 + 下面的旧槽位迁移已经能吃下 v1 和 v2。
             // v2 是「双指拖动/捏合拆成方向性槽位」那次改动，写出来是为了将来再
             // 出现无法用「字段缺失=默认」表达的迁移时，有个能分辨的依据。
+            // v3 是加了 shortcuts 块（物理键盘快捷键），同样纯加字段，没有分支。
             val bindingsJson = root.optJSONObject(KEY_BINDINGS)
             val bindings = GestureSlot.entries.associateWith { slot ->
                 val raw = bindingsJson?.optString(slot.name)?.takeIf { it.isNotEmpty() }
@@ -557,14 +566,20 @@ data class GestureConfig(
                 twoFingerDoubleTapWindowMs = twoFingerWindow,
             )
 
-            return GestureConfig(bindings, thresholds)
+            // v3 新增的 shortcuts 块：v1/v2 存档没有它，optJSONObject 返回 null，
+            // fromJsonObject(null) 就是出厂键位，其余所有字段原样保留。块类型不对
+            // （不是对象）同样当缺失。块内部的逐动作容错见 ShortcutBindings.fromJsonObject。
+            val shortcuts = ShortcutBindings.fromJsonObject(root.optJSONObject(KEY_SHORTCUTS))
+
+            return GestureConfig(bindings, thresholds, shortcuts)
         }
     }
 }
 
-private const val JSON_VERSION = 2
+private const val JSON_VERSION = 3
 private const val KEY_VERSION = "v"
 private const val KEY_BINDINGS = "bindings"
+private const val KEY_SHORTCUTS = "shortcuts"
 private const val KEY_THRESHOLDS = "thresholds"
 private const val KEY_ONE_FINGER_HOLD_MS = "oneFingerHoldMs"
 private const val KEY_TWO_FINGER_HOLD_MS = "twoFingerHoldMs"

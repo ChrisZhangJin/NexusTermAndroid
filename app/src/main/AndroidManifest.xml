@@ -47,11 +47,20 @@
           (setDecorFitsSystemWindows(false)): that would replace the resize
           with IME insets, which this app's minSdk-26 floor can't rely on —
           WindowInsets.ime is only populated from API 30.
+
+          configChanges 里的 keyboard|navigation：插拔蓝牙/USB
+          物理键盘会让系统报这几类配置变化，没声明就会销毁重建整个 Activity。
+          而 MainActivity 把所有活着的 SSH 标签放在普通的 remember 里
+          （liveSessions，不是 rememberSaveable，也存不进 Bundle），重建 =
+          所有标签连同终端滚动缓冲一起消失。声明之后系统只回调
+          onConfigurationChanged，Activity 和标签原样保留；键盘的接入由
+          HardKeyboardMonitor 用 InputDeviceListener 自己感知，不靠重建。
+          （keyboardHidden 早就在列了，原因同理：软键盘/折叠状态变化不该重建。）
         -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.NexusTermAndroid">
             <intent-filter>
