@@ -745,6 +745,15 @@ fun TerminalTabsPager(
         val p = pe.coerceIn(0f, 1f)
         val scale = 1f - (1f - OPEN_SCALE) * pe
 
+        // 按键栏占没占位置会让分页器的高度差 84dp，卡片和转盘的位置就跟着变：
+        // 刚连上时栏在（占位），闲置几秒后栏收起（不占位），再打开切换器卡片就整体
+        // 往下掉、转盘也低了一截。这里以「占位」为基准把几何固定下来：
+        // deltaPx 是当前比基准多出的高度；分页器整体上移一半让中心对齐，卡片按
+        // 基准高度等比缩一点让上下边对齐，转盘圆心（见下面 originY）也相应折算。
+        // 不能直接把栏的占位改掉：那会真的改变终端尺寸，让远端 pty 在每次打开
+        // 切换器时 resize 一次。
+        val deltaPx = keyBarHeightPx - with(LocalDensity.current) { keyBar.reservedHeight.toPx() }
+
         /** 这一页相对分页器中心的有符号偏移：右边的页为负，和 `graphicsLayer` 里用的一致。 */
         fun pageOffset(page: Int): Float =
             pagerState.currentPage - page + pagerState.currentPageOffsetFraction
@@ -773,6 +782,7 @@ fun TerminalTabsPager(
             // the remote pty.
             modifier = Modifier
                 .fillMaxSize()
+                .graphicsLayer { translationY = -deltaPx / 2f * pe }
                 .padding(bottom = keyBar.reservedHeight),
             beyondViewportPageCount = if (isOpen) 1 else 0,
             // Horizontal swipes belong to the terminal until the cards are
@@ -805,7 +815,10 @@ fun TerminalTabsPager(
                     .graphicsLayer {
                         val offset = pageOffset(page)
                         val radius = WHEEL_RADIUS_PER_WIDTH * size.width
-                        val centreY = size.height + radius - wheelRise(size.height.toDp()).toPx()
+                        // 分页器上移了 deltaPx/2 * pe，转盘却始终贴在基准高度的底边，
+                        // 所以圆心在本页坐标里是：基准底边 + (radius − rise)。
+                        val baseHeight = size.height - deltaPx
+                        val centreY = baseHeight + deltaPx / 2f * pe + radius - wheelRise(baseHeight.toDp()).toPx()
                         transformOrigin = TransformOrigin(0.5f, if (size.height > 0f) centreY / size.height else 0.5f)
                         translationX = offset * size.width * pe
                         rotationZ = -offset.coerceIn(-MAX_WHEEL_OFFSET, MAX_WHEEL_OFFSET) *
@@ -821,7 +834,8 @@ fun TerminalTabsPager(
                         .fillMaxSize()
                         .graphicsLayer {
                             val away = abs(pageOffset(page)).coerceIn(0f, 1f)
-                            val s = scale * (1f - NEIGHBOUR_SHRINK * away * p)
+                            val fit = if (size.height > 0f) 1f - (1f - (size.height - deltaPx) / size.height) * pe else 1f
+                            val s = scale * fit * (1f - NEIGHBOUR_SHRINK * away * p)
                             scaleX = s
                             scaleY = s
                             translationY = -CardLift.toPx() * pe
@@ -932,7 +946,7 @@ fun TerminalTabsPager(
                 onLabelClick = { renamingId = centred.id },
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(bottom = keyBar.reservedHeight),
+                    .padding(bottom = TerminalKeyBarHeight),
             )
         }
 

@@ -456,8 +456,11 @@ fun rememberTerminalKeyBarState(handle: TerminalHandle, enabled: Boolean): Termi
     // (`enabled` is deliberately not part of this: the card switcher hides the
     // bar but keeps its space, see the parameter doc.)
     val dismissed = !imeVisible && (!state.atBottom || !state.summoned)
-    LaunchedEffect(dismissed, state.onScreen) {
-        if (dismissed && !state.onScreen) state.reserved = false
+    // `enabled` 只作为「冻结」条件：切换器开着时栏本来就收了，但它的占位不能在这时
+    // 候交还，否则终端会在卡片底下 resize（卡片也跟着变形）。合上之后这个 effect
+    // 重新跑，该交还的再交还。
+    LaunchedEffect(dismissed, state.onScreen, enabled) {
+        if (enabled && dismissed && !state.onScreen) state.reserved = false
     }
 
     return state
