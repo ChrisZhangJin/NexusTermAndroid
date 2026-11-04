@@ -530,6 +530,7 @@ class MainActivity : ComponentActivity() {
                         live.liveSessionId = handle.sessionId
                         live.terminal = createTerminal(
                             context = this@MainActivity,
+                            historyKey = live.savedSessionId,
                             // Read `live.liveSessionId` at call time, not
                             // capture time — it's still "" right now, and a
                             // reconnect will replace it again later.

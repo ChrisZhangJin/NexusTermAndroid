@@ -79,6 +79,8 @@ internal object TerminalPrefs {
 class TerminalHandle internal constructor(
     internal val webView: WebView,
     fontSize: Int,
+    /** 命令历史按它分开存（已保存会话的 id）；空串 = 不记录。 */
+    val historyKey: String = "",
 ) {
     /** Font size this terminal is showing, in CSS px. */
     var fontSize: Int = fontSize
@@ -212,6 +214,17 @@ class TerminalHandle internal constructor(
     fun paste(text: String) {
         val b64 = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
         webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.pasteBase64('$b64');", null)
+    }
+
+    /**
+     * 从历史面板把 [cmd] 放到命令行上。先 Ctrl+A Ctrl+K 清掉已经敲了一半的内容（和按 ↑ 召回
+     * 历史一样是「替换」而不是「追加」），再走粘贴：bash / zsh 的括号粘贴保证它只是落在
+     * 行上而不被执行。[run] = true 再补一个回车。
+     */
+    fun insertCommand(cmd: String, run: Boolean) {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.sendKeyBase64('AQs=');", null)
+        paste(cmd)
+        if (run) webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.sendKeyBase64('DQ==');", null)
     }
 
     fun clearScreen() {
@@ -384,6 +397,7 @@ fun createTerminal(
     context: Context,
     onInput: (String) -> Unit,
     onResize: (cols: Int, rows: Int) -> Unit,
+    historyKey: String = "",
 ): TerminalHandle {
     val startFontSize = TerminalPrefs.fontSize(context)
     val webView = WebView(context).apply {
@@ -421,6 +435,12 @@ fun createTerminal(
                     CoroutineScope(Dispatchers.Main).launch { onResize(cols, rows) }
                 }
 
+                // 回车那一刻页面从屏幕上读出的命令，见 index.html 的 captureCommand。
+                @JavascriptInterface
+                fun onCommand(cmd: String) {
+                    CommandHistory.record(context, historyKey, cmd)
+                }
+
                 // Read synchronously by index.html before its first fit.
                 @JavascriptInterface
                 fun initialFontSize(): Int = startFontSize
@@ -429,7 +449,7 @@ fun createTerminal(
         )
     }
 
-    val handle = TerminalHandle(webView, startFontSize)
+    val handle = TerminalHandle(webView, startFontSize, historyKey)
     webView.webViewClient = object : WebViewClient() {
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)

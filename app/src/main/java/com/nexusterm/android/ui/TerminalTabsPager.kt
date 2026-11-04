@@ -47,6 +47,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -408,6 +409,9 @@ fun TerminalTabsPager(
     // remember 本来就能活过旋转，没必要用 rememberSaveable。
     var showHelp by remember { mutableStateOf(false) }
 
+    // 命令历史面板（底部抽屉，独立窗口），和上面几个对话框同一个约定。键盘栏的 HIST 键和终端菜单都开它。
+    var showHistory by remember { mutableStateOf(false) }
+
     // 整个终端区域的像素尺寸，只为「终端菜单」快捷键找个锚点（区域中心）。
     var areaSize by remember { mutableStateOf(IntSize.Zero) }
 
@@ -430,6 +434,7 @@ fun TerminalTabsPager(
         handle = tabs[activeIndex].handle,
         enabled = !isOpen,
     )
+    SideEffect { keyBar.onHistory = { showHistory = true } }
     val keyBarHeightPx = with(LocalDensity.current) { TerminalKeyBarHeight.toPx() }
     val pinchStepPx = with(LocalDensity.current) { PinchStepPerFontSize.toPx() }
 
@@ -551,7 +556,7 @@ fun TerminalTabsPager(
      */
     fun performShortcut(action: ShortcutAction): Boolean {
         // 对话框开着时按键到不了这里（对话框是独立窗口，自己收按键）；万一到了也别动手。
-        if (renamingId != null || closeConfirmId != null || showHelp) return true
+        if (renamingId != null || closeConfirmId != null || showHelp || showHistory) return true
         // 任何快捷键都算「别的键」：撤销切换器里待确认的断开。
         closeArm = closeArm.disarm()
         // 切换器开着时终端本身是被盖住的（手势那边也只在关着的时候识别），所以只有标签类
@@ -622,7 +627,7 @@ fun TerminalTabsPager(
     fun handleSwitcherKey(keyCode: Int): Boolean {
         // 和 userScrollEnabled 同一个阈值：过半才算「打开了」，收起动画的尾巴不再响应。
         if (progress.value <= 0.5f) return false
-        if (renamingId != null || closeConfirmId != null || showHelp) return false
+        if (renamingId != null || closeConfirmId != null || showHelp || showHistory) return false
         // 除了 Backspace / Delete 自己，任何键都撤销待确认的断开。
         if (keyCode != KeyEvent.KEYCODE_DEL && keyCode != KeyEvent.KEYCODE_FORWARD_DEL) {
             closeArm = closeArm.disarm()
@@ -1016,6 +1021,7 @@ fun TerminalTabsPager(
                 onDismiss = { menuAt = null },
                 onPaste = { pasteFromClipboard() },
                 onShowHelp = { showHelp = true },
+                onShowHistory = { showHistory = true },
                 onOpenSftp = { onOpenSftp(tabs[activeIndex].id) },
                 onDisconnect = { onCloseTab(tabs[activeIndex].id) },
             )
@@ -1055,6 +1061,10 @@ fun TerminalTabsPager(
         // 终端菜单里的「操作说明」。HelpDialog 自己就是 Compose 对话框（独立窗口），
         // 开着的时候触摸和按键都到不了下面的终端；快捷键表传 gestureConfig.shortcuts，
         // 这样显示的是用户改绑后的键位。
+        if (showHistory) {
+            HistorySheet(handle = tabs[activeIndex].handle, onDismiss = { showHistory = false })
+        }
+
         if (showHelp) {
             HelpDialog(
                 onDismiss = {
@@ -1343,6 +1353,7 @@ private fun TerminalMenu(
     onDismiss: () -> Unit,
     onPaste: () -> Unit,
     onShowHelp: () -> Unit,
+    onShowHistory: () -> Unit,
     onOpenSftp: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -1381,6 +1392,10 @@ private fun TerminalMenu(
             // 手势和快捷键恰恰是在终端里用的，所以终端菜单里要能直接查到。不放在最末，
             // 是因为「断开」是破坏性操作、必须留在最底下；帮助紧贴着它的话，手指落点一偏就
             // 把会话断了。放在这里，下面隔着一条分割线和 SFTP 才轮到「断开」，误点最多是弹个说明。
+            DropdownMenuItem(
+                text = { Text("命令历史") },
+                onClick = { onDismiss(); onShowHistory() },
+            )
             DropdownMenuItem(
                 text = { Text("操作说明") },
                 onClick = { onDismiss(); onShowHelp() },

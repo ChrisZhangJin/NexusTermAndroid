@@ -560,7 +560,78 @@
   // gives us UTF-16 JS strings); Kotlin re-encodes to UTF-8 bytes before
   // handing them to nexus-core's write(). This mirrors the desktop app's
   // "whatever xterm emits, forward untouched" behaviour for key handling.
+  // ---- Command capture, for the history panel ----
+  // The shell's own line editor is the only thing that knows what is about to
+  // run (tab completion, an Up-arrow recall, cursor edits), so instead of
+  // replaying keystrokes we read the command back off the screen at the moment
+  // Enter is pressed. That needs to know where the prompt ended: whenever
+  // output has been quiet for a moment and the cursor sits at the end of a
+  // line that ends like a shell prompt, remember that spot. Typing freezes it
+  // until the next Enter, so the echo of what the user types is never mistaken
+  // for a prompt -- and a password prompt ("Password: ") never matches, so what
+  // is typed into it is never recorded.
+  var PROMPT_TAIL = /[$#%>\u276F\u279C\u00BB\u03BB][\s\u00A0]?$/;
+  var promptAt = null;   // {row, x, text}: where the shell's input line starts
+  var typedSince = false;
+  var promptTimer = null;
+
+  function schedulePromptMark() {
+    if (promptTimer) clearTimeout(promptTimer);
+    promptTimer = setTimeout(markPrompt, 250);
+  }
+
+  function markPrompt() {
+    promptTimer = null;
+    if (typedSince) return;
+    var buf = term.buffer.active;
+    var row = buf.baseY + buf.cursorY;
+    var line = buf.getLine(row);
+    if (!line) return;
+    var before = line.translateToString(false, 0, buf.cursorX);
+    var after = line.translateToString(true, buf.cursorX);
+    promptAt = (PROMPT_TAIL.test(before) && after.trim() === "")
+      ? { row: row, x: buf.cursorX, text: before }
+      : null;
+  }
+
+  function captureCommand() {
+    var p = promptAt;
+    promptAt = null;
+    typedSince = false;
+    if (!p || !window.NexusAndroid || !window.NexusAndroid.onCommand) return;
+    var buf = term.buffer.active;
+    var cur = buf.baseY + buf.cursorY;
+    var first = buf.getLine(p.row);
+    if (!first || cur < p.row || cur - p.row > 30) return;
+    // The screen scrolled or was redrawn since the prompt was seen.
+    if (first.translateToString(false, 0, p.x) !== p.text) return;
+    // A command longer than one row continues on rows flagged isWrapped.
+    var cmd = "";
+    var r = p.row;
+    for (;;) {
+      var line = buf.getLine(r);
+      var next = buf.getLine(r + 1);
+      var more = !!(next && next.isWrapped);
+      cmd += line.translateToString(!more, r === p.row ? p.x : 0);
+      if (!more) break;
+      r++;
+    }
+    if (cur > r) return;
+    cmd = cmd.replace(/\s+$/, "");
+    if (cmd) window.NexusAndroid.onCommand(cmd);
+  }
+
+  function noteInputForHistory(data) {
+    if (data === "\r") captureCommand();
+    else if (data === "\x03" || data === "\x04" || data === "\x0c") {
+      // Ctrl+C / D / L redraw the prompt somewhere else; look for it afresh.
+      promptAt = null;
+      typedSince = false;
+    } else typedSince = true;
+  }
+
   function sendInput(data) {
+    noteInputForHistory(data);
     // Typing is what the virtual window follows the cursor for -- output
     // alone (a `top` repainting the whole screen) must not yank the view
     // around, so cursor moves only count for a moment after input.
@@ -618,7 +689,7 @@
       for (var i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
       }
-      term.write(bytes);
+      term.write(bytes, schedulePromptMark);
     },
     notifyClosed: function (reason) {
       term.write("\r\n\x1b[31m[connection closed: " + reason + "]\x1b[0m\r\n");

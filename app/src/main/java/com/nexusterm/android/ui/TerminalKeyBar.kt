@@ -145,14 +145,19 @@ private val SwipeCommit = 40.dp
 
 internal enum class StickyModifier { CTRL, ALT }
 
+/** Caps that open something of the app's own instead of sending bytes. */
+internal enum class BarAction { HISTORY }
+
 /**
- * One cap. Exactly one of [payload]/[sticky] is set: the sticky modifiers arm
- * state in the page instead of sending anything.
+ * One cap. Exactly one of [payload]/[sticky]/[action] is set: the sticky
+ * modifiers arm state in the page instead of sending anything, and an [action]
+ * is handled by the app (e.g. opening the history panel).
  */
 internal class KeyDef(
     val label: String,
     val payload: String? = null,
     val sticky: StickyModifier? = null,
+    val action: BarAction? = null,
 )
 
 // Labels follow Termux's row, which is the layout the user asked to be
@@ -165,24 +170,28 @@ private val ROW_ONE = listOf(
     KeyDef("HOME", "\u001b[H"),
     KeyDef("↑", "\u001b[A"),
     KeyDef("END", "\u001b[F"),
-    KeyDef("PGUP", "\u001b[5~"),
+    KeyDef("ENTER", "\r"),
 )
 
 private val ROW_TWO = listOf(
-    KeyDef("⇥", "\t"),
+    KeyDef("_", "_"),
     KeyDef("CTRL", sticky = StickyModifier.CTRL),
     KeyDef("ALT", sticky = StickyModifier.ALT),
     KeyDef("←", "\u001b[D"),
     KeyDef("↓", "\u001b[B"),
     KeyDef("→", "\u001b[C"),
-    KeyDef("PGDN", "\u001b[6~"),
+    KeyDef("TAB", "\t"),
 )
 
 private val ESC = Char(0x1B).toString()
 
 // The shell punctuation that is furthest away on a phone's symbol keyboard.
-private val SYMBOLS_ONE = listOf("|", "~", "`", "\\", "$", "&", "*").map { KeyDef(it, it) }
-private val SYMBOLS_TWO = listOf("{", "}", "[", "]", "<", ">", ";").map { KeyDef(it, it) }
+// PGUP / PGDN sit at the end of these rows (eight caps instead of seven): the first page
+// needed their slots for ENTER / TAB, and this is the page the user asked for them on.
+private val SYMBOLS_ONE = listOf("|", "~", "`", "\\", "$", "&", "*").map { KeyDef(it, it) } +
+    KeyDef("PGUP", "\u001b[5~")
+private val SYMBOLS_TWO = listOf("{", "}", "[", "]", "<", ">", ";").map { KeyDef(it, it) } +
+    KeyDef("PGDN", "\u001b[6~")
 
 // xterm's encodings, which is what TERM=xterm-256color promises the remote.
 private val FN_ONE = listOf(
@@ -193,6 +202,7 @@ private val FN_ONE = listOf(
     KeyDef("F5", "${ESC}[15~"),
     KeyDef("F6", "${ESC}[17~"),
     KeyDef("F7", "${ESC}[18~"),
+    KeyDef("HIST", action = BarAction.HISTORY),
 )
 
 private val FN_TWO = listOf(
@@ -203,6 +213,8 @@ private val FN_TWO = listOf(
     KeyDef("F12", "${ESC}[24~"),
     KeyDef("INS", "${ESC}[2~"),
     KeyDef("DEL", "${ESC}[3~"),
+    // Ctrl+R: the shell's reverse history search, one tap instead of CTRL then r.
+    KeyDef("^R", "\u0012"),
 )
 
 /** Two rows each; a horizontal swipe across the bar flips between them. */
@@ -314,8 +326,15 @@ class TerminalKeyBarState internal constructor(handle: TerminalHandle) {
     /** What [TerminalTabsPager] subtracts from the terminal's height. */
     val reservedHeight: Dp get() = if (reserved) TerminalKeyBarHeight else 0.dp
 
+    /** Opens the command-history panel; wired by the pager, which owns the sheet. */
+    internal var onHistory: () -> Unit = {}
+
     internal fun onKey(key: KeyDef) {
         noteActivity()
+        if (key.action == BarAction.HISTORY) {
+            onHistory()
+            return
+        }
         val sticky = key.sticky
         if (sticky != null) {
             when (sticky) {
