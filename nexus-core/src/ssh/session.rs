@@ -184,6 +184,8 @@ if [ -n "$fg" ] && [ "$fg" -gt 0 ] 2>/dev/null && [ -r "/proc/$fg/cmdline" ]; th
   echo "FG_CWD=$(readlink /proc/$fg/cwd 2>/dev/null)"
   printf 'FG_ARGS='; tr '\0' '\037' < /proc/$fg/cmdline 2>/dev/null; echo
 fi
+# exec 通道的 PATH 常常是 sshd 的精简默认值，找不到 /usr/local/bin、Homebrew 里的 tmux。
+PATH="$PATH:/usr/local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin"; export PATH
 if command -v tmux >/dev/null 2>&1; then
   # list-clients 按 tty 匹配（display-message -p -c 在 tmux 3.2 不可用）
   tmux list-clients -F '#{client_tty}	#{session_name}	#{pane_current_path}' 2>/dev/null |

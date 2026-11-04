@@ -83,16 +83,19 @@ fun parseProbe(raw: Map<String, String>, now: Long): TermContext? {
     val fgComm = raw["FG_COMM"].orEmpty()
     val fgArgs = raw["FG_ARGS"].orEmpty().split(US).filter { it.isNotEmpty() }
 
-    val tmuxSession = raw["TMUX_SESSION"]
-    if (!tmuxSession.isNullOrEmpty()) {
-        val cwd = raw["TMUX_PATH"]?.takeIf { it.isNotEmpty() }
-            ?: raw["SHELL_CWD"]?.takeIf { it.isNotEmpty() }
+    // 路径 / 会话名最后会被原样敲进用户的 shell：含换行等控制字符的（目录名可以这么起）
+    // 一律当作缺失，宁可不还原也不往终端里打出能被当成回车的东西。
+    fun clean(key: String): String? =
+        raw[key]?.takeIf { v -> v.isNotEmpty() && v.none { it < ' ' || it == '\u007f' } }
+
+    val tmuxSession = clean("TMUX_SESSION")
+    if (tmuxSession != null) {
+        val cwd = clean("TMUX_PATH") ?: clean("SHELL_CWD")
         return TermContext(cwd = cwd, tmux = tmuxSession, docker = null, at = now)
     }
 
     val docker = if (fgComm in DOCKER_BINS && fgArgs.isNotEmpty()) parseDocker(fgArgs) else null
-    val cwd = raw["SHELL_CWD"]?.takeIf { it.isNotEmpty() }
-        ?: raw["FG_CWD"]?.takeIf { it.isNotEmpty() }
+    val cwd = clean("SHELL_CWD") ?: clean("FG_CWD")
     if (cwd == null && docker == null) return null
     return TermContext(cwd = cwd, tmux = null, docker = docker, at = now)
 }
@@ -111,11 +114,18 @@ fun shq(s: String): String = "'" + s.replace("'", "'\\''") + "'"
  * 用户不想要的操作，只在 [restoreNotice] 里提示。
  */
 fun restoreCommand(ctx: TermContext): String? {
-    val parts = ArrayList<String>(2)
-    if (!ctx.cwd.isNullOrEmpty()) parts += "cd -- ${shq(ctx.cwd)} 2>/dev/null"
-    if (!ctx.tmux.isNullOrEmpty()) parts += "tmux attach -t ${shq(ctx.tmux)}"
-    if (parts.isEmpty()) return null
-    return parts.joinToString("; ")
+    val cd = ctx.cwd?.takeIf { it.isNotEmpty() }?.let { "cd -- ${shq(it)} 2>/dev/null" }
+    val tmux = ctx.tmux?.takeIf { it.isNotEmpty() }
+        // `=` 要求会话名精确匹配（默认是前缀 / 通配匹配，原会话没了会误附到 accid2）；
+        // `-d` 先踢掉掉线后服务端还没发现死掉的旧客户端，否则它会和新客户端共享会话。
+        ?.let { "tmux attach -d -t ${shq("=$it")}" }
+    return when {
+        // attach 失败（会话没了，比如服务器重启过）才落到 cd，错误信息留在屏幕上不吞。
+        // 成功时 pane 自己带着目录，cd 多余；用户 detach / 退出 tmux 后 attach 返回 0，也不会 cd。
+        tmux != null && cd != null -> "$tmux || $cd"
+        tmux != null -> tmux
+        else -> cd
+    }
 }
 
 /**

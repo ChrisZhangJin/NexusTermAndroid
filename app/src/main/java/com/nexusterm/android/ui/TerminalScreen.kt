@@ -147,6 +147,11 @@ class TerminalHandle internal constructor(
         }
     }
 
+    /** See `resetModes` in index.html: clears tmux/vim's alt screen and mouse modes locally. */
+    fun resetModes() {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.resetModes();", null)
+    }
+
     fun notifyClosed(reason: String) {
         val safeReason = reason.replace("\\", "\\\\").replace("'", "\\'")
         webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.notifyClosed('$safeReason');", null)

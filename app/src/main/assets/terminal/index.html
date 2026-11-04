@@ -623,6 +623,18 @@
     notifyClosed: function (reason) {
       term.write("\r\n\x1b[31m[connection closed: " + reason + "]\x1b[0m\r\n");
     },
+    /**
+     * Local-only reset of the modes a remote full-screen program leaves on
+     * when the connection dies under it (tmux / vim: alternate screen, mouse
+     * tracking, application cursor keys, bracketed paste). Written into xterm,
+     * never sent to the remote. Without it the dead tmux UI stays on screen
+     * and touches keep being encoded as mouse reports / arrow keys into the
+     * fresh shell after a reconnect.
+     */
+    resetModes: function () {
+      term.write("\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l" +
+        "\x1b[?2004l\x1b[?1l\x1b>\x1b[?25h\x1b[0m");
+    },
     clear: function () {
       term.clear();
     },

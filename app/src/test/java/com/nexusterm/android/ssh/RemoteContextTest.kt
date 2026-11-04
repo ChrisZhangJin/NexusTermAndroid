@@ -243,22 +243,32 @@ class RemoteContextTest {
     @Test
     fun restoreCommandTmuxWithCwd() {
         val ctx = TermContext("/srv", "work", null, now)
-        assertEquals("cd -- '/srv' 2>/dev/null; tmux attach -t 'work'", restoreCommand(ctx))
+        assertEquals("tmux attach -d -t '=work' || cd -- '/srv' 2>/dev/null", restoreCommand(ctx))
     }
 
     @Test
     fun restoreCommandTmuxOnly() {
         val ctx = TermContext(null, "work", null, now)
-        assertEquals("tmux attach -t 'work'", restoreCommand(ctx))
+        assertEquals("tmux attach -d -t '=work'", restoreCommand(ctx))
     }
 
     @Test
     fun restoreCommandQuotesAwkwardNames() {
         val ctx = TermContext("/it's here", "a b", null, now)
         assertEquals(
-            """cd -- '/it'\''s here' 2>/dev/null; tmux attach -t 'a b'""",
+            """tmux attach -d -t '=a b' || cd -- '/it'\''s here' 2>/dev/null""",
             restoreCommand(ctx),
         )
+    }
+
+    @Test
+    fun parseProbeDropsValuesWithControlCharacters() {
+        // 目录名可以含换行：原样敲进 shell 会被当成回车，宁可当作缺失。
+        val ctx = parseProbe(mapOf("SHELL_CWD" to "/tmp/a\nrm -rf x", "FG_CWD" to "/ok"), now)
+        assertEquals("/ok", ctx?.cwd)
+        assertNull(parseProbe(mapOf("SHELL_CWD" to "/tmp/a\rb"), now))
+        val tmux = parseProbe(mapOf("TMUX_SESSION" to "w\nx", "SHELL_CWD" to "/h"), now)
+        assertNull(tmux?.tmux)
     }
 
     @Test

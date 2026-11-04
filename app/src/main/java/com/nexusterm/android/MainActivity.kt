@@ -150,7 +150,7 @@ private const val SGR_YELLOW = "33"
  * 探测只为「断线时知道用户在哪个目录 / tmux 会话」，30 秒的粒度足够，也不给服务器添负担。
  */
 private const val PROBE_FIRST_DELAY_MS = 3_000L
-private const val PROBE_INTERVAL_MS = 30_000L
+private const val PROBE_INTERVAL_MS = 10_000L
 
 /**
  * 按住长按时允许「重复触发」的快捷键动作：切标签、调字号这类「按一次一档、按住连续走」
@@ -886,6 +886,9 @@ class MainActivity : ComponentActivity() {
             runCatching { SshClient.disconnect(live.liveSessionId) }
 
             live.sawAuthPrompt = false
+            // 掉线时远端的全屏程序（tmux / vim）没机会收尾：备用屏、鼠标上报都还开着，
+            // 触摸会被编码成鼠标序列打进新 shell。本地先复位（只写进 xterm，不发给远端）。
+            live.terminal?.resetModes()
             live.terminal?.writeNotice("正在重连 ${saved.host}:${saved.port}…")
 
             // NonCancellable: the handshake is a blocking JNI call that can't
