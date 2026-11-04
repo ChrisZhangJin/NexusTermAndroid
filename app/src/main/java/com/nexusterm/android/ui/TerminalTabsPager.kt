@@ -99,6 +99,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.PI
@@ -398,6 +399,10 @@ fun TerminalTabsPager(
     // 键盘「关闭标签」等待确认的那条标签，null = 没有对话框。同样存 id，理由同上。
     var closeConfirmId by remember { mutableStateOf<String?>(null) }
 
+    // 切换器里键盘 Backspace / Delete 断开的二次确认，见 CloseArm。不用对话框：独立窗口会抢走
+    // 切换器的按键路由（handleSwitcherKey 在对话框开着时直接放行），所以提示画在页面里。
+    var closeArm by remember { mutableStateOf(CloseArm.IDLE) }
+
     // 终端菜单里「操作说明」对话框开着没有。和上面两个对话框同一个约定：plain remember。
     // Activity 声明了 configChanges（含 orientation|screenSize），旋转不会重建它，
     // remember 本来就能活过旋转，没必要用 rememberSaveable。
@@ -504,6 +509,19 @@ fun TerminalTabsPager(
     // 切换器打开的那一刻记下当前标签，见 switcherOriginId。
     LaunchedEffect(isOpen) { if (isOpen) switcherOriginId = activeTabIdNow }
 
+    // 断开确认只在「刚按过那一下、卡片还是它」时有效：超时、切换器收起、转盘转到别的卡片
+    // （滑动 / 点名字 / 键盘都算）都撤销。上膛时 closeArm 是新值，effect 重启、重新计时。
+    LaunchedEffect(closeArm) {
+        if (closeArm.tabId != null) {
+            delay(CLOSE_ARM_WINDOW_MS)
+            closeArm = closeArm.disarm()
+        }
+    }
+    LaunchedEffect(isOpen) { if (!isOpen) closeArm = closeArm.disarm() }
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.targetPage }.collect { closeArm = closeArm.disarm() }
+    }
+
     /**
      * 键盘切到第 [page] 个标签。切换器关着：和点标签 / 选卡片一样走 [onActiveTabChange]，
      * 上面的 LaunchedEffect 负责把分页器无动画地跟过去。切换器开着：只是把转盘转到
@@ -534,6 +552,8 @@ fun TerminalTabsPager(
     fun performShortcut(action: ShortcutAction): Boolean {
         // 对话框开着时按键到不了这里（对话框是独立窗口，自己收按键）；万一到了也别动手。
         if (renamingId != null || closeConfirmId != null || showHelp) return true
+        // 任何快捷键都算「别的键」：撤销切换器里待确认的断开。
+        closeArm = closeArm.disarm()
         // 切换器开着时终端本身是被盖住的（手势那边也只在关着的时候识别），所以只有标签类
         // 动作有意义；其余的吃掉按键、什么都不做。
         if (progress.value > 0f && action.group != ShortcutGroup.TAB) return true
@@ -591,8 +611,10 @@ fun TerminalTabsPager(
     /**
      * 切换器打开时的按键：左右 = 转盘移到上一张 / 下一张（和左右划一样，不循环），
      * Enter = 选中并收起（和点中间那张卡片一样），Esc = 收起且不换标签，
-     * Backspace / Delete = 断开选中的那张（和上划是同一个 [onCloseTab]，上划本身
-     * 没有确认，所以这里也没有）。切换器没开返回 false，按键照常走；开着时无修饰键一律吃掉。
+     * Backspace / Delete = 断开选中的那张（和上划是同一个 [onCloseTab]），但要按两下：
+     * 第一下只上膛并显示提示（[CloseArm]），[CLOSE_ARM_WINDOW_MS] 内同一张卡片上再按一下
+     * 才断开；别的键、换卡片、超时都撤销。上划是有意的手势，所以没有这一步。
+     * 切换器没开返回 false，按键照常走；开着时无修饰键一律吃掉（两下 Delete 也不会漏给终端）。
      *
      * 「选中的那张」取 targetPage 而不是 currentPage：快速连按 → → Enter 时动画还
      * 没停稳，currentPage 落后一张，targetPage 才是用户按键之后想要的那张。
@@ -601,6 +623,10 @@ fun TerminalTabsPager(
         // 和 userScrollEnabled 同一个阈值：过半才算「打开了」，收起动画的尾巴不再响应。
         if (progress.value <= 0.5f) return false
         if (renamingId != null || closeConfirmId != null || showHelp) return false
+        // 除了 Backspace / Delete 自己，任何键都撤销待确认的断开。
+        if (keyCode != KeyEvent.KEYCODE_DEL && keyCode != KeyEvent.KEYCODE_FORWARD_DEL) {
+            closeArm = closeArm.disarm()
+        }
         when (keyCode) {
             KeyEvent.KEYCODE_DPAD_LEFT -> scope.launch {
                 pagerState.animateScrollToPage((pagerState.targetPage - 1).coerceAtLeast(0))
@@ -625,7 +651,11 @@ fun TerminalTabsPager(
                 }
             }
             KeyEvent.KEYCODE_DEL, KeyEvent.KEYCODE_FORWARD_DEL ->
-                tabs.getOrNull(pagerState.targetPage)?.let { onCloseTab(it.id) }
+                tabs.getOrNull(pagerState.targetPage)?.let { tab ->
+                    val r = closeArm.press(tab.id, SystemClock.elapsedRealtime())
+                    closeArm = r.next
+                    if (r.close) onCloseTab(tab.id)
+                }
             // 其余无修饰键也吃掉：切换器开着时终端被盖住，漏过去的上下键 / 字母会
             // 变成远端的历史翻页和输入，用户却只看见卡片。带修饰键的走不到这里。
             else -> Unit
@@ -957,6 +987,27 @@ fun TerminalTabsPager(
             state = keyBar,
             modifier = Modifier.align(Alignment.BottomCenter),
         )
+
+        // 键盘断开的待确认提示：盖在卡片上方，不拦触摸、不抢焦点（所以不是对话框）。
+        // 取 targetPage 那张的名字，和 handleSwitcherKey 断开的是同一张；换卡片 / 超时
+        // 时 closeArm 会被撤销，这里自然消失。
+        if (isOpen) {
+            val armed = tabs.getOrNull(pagerState.targetPage)?.takeIf { it.id == closeArm.tabId }
+            if (armed != null) {
+                Text(
+                    text = "再按一次 Backspace / Delete 断开「${armed.name}」，其他键取消",
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 16.dp, start = 24.dp, end = 24.dp)
+                        .background(Color(0xE6B3261E), RoundedCornerShape(12.dp))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
+        }
 
         menuAt?.let { at ->
             TerminalMenu(

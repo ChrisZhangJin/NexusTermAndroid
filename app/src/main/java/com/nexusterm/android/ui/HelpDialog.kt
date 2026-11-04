@@ -93,7 +93,7 @@ private fun keyboardShortcutSection(shortcuts: ShortcutBindings): Pair<String, L
 
     // 下面几条是固定文字，不来自绑定表：它们描述的是行为约定，不随改绑变化。
     lines += SUBHEADER_PREFIX + "其它说明"
-    lines += "会话切换器打开时：←/→ 选卡，Enter 进入，Esc 取消，Delete 断开该会话"
+    lines += "会话切换器打开时：←/→ 选卡，Enter 进入，Esc 取消，Delete 断开该会话（连按两下确认）"
     lines += "Ctrl+C、Ctrl+Z、Ctrl+字母和 Alt+字母原样发给远端，不会被应用占用"
     lines += "在系统层 Meta+/ 可以打开 Android 的键盘快捷键面板，里面同样列出这些快捷键"
     lines += "快捷键可在 首页 → 设置 → 手势设置 → 键盘快捷键 里修改"
