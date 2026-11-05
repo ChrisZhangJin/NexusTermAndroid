@@ -402,6 +402,11 @@ class MainActivity : ComponentActivity() {
             // just quietly did nothing.
             var connectError by remember { mutableStateOf<String?>(null) }
 
+            // 正在拨号（SSH 握手 + 认证还没完成）的保存配置 id。首页据此把「连接」
+            // 置灰并播放进度动画；同一条配置在拨号期间不会再开第二路拨号，
+            // 否则连点两下就是两个标签。
+            val connectingIds = remember { mutableStateListOf<String>() }
+
             /**
              * The user-initiated close：切换器里上划关掉一张卡、首页卡片上的
              * 「断开」，以及通知栏「全部断开」之后 Rust 回调回来的那条
@@ -434,7 +439,9 @@ class MainActivity : ComponentActivity() {
              * terminal, and its own tab.
              */
             fun connect(session: SessionRecord) {
+                if (session.id in connectingIds) return
                 connectError = null
+                connectingIds.add(session.id)
                 lifecycleScope.launch {
                     try {
                         val auth = authMethodFor(session)
@@ -570,6 +577,8 @@ class MainActivity : ComponentActivity() {
                     } catch (e: SessionException) {
                         Log.e(TAG, "connect failed", e)
                         connectError = e.friendlyText()
+                    } finally {
+                        connectingIds.remove(session.id)
                     }
                 }
             }
@@ -685,6 +694,19 @@ class MainActivity : ComponentActivity() {
                                         ?.let(::disconnectLive)
                                 },
                                 connectError = connectError,
+                                onDismissError = { connectError = null },
+                                connectingIds = connectingIds.toSet(),
+                                // 回到用户在首页菜单里点中的那一条标签（一条配置有多条标签时）。
+                                // tabId 可能已经不在表里（菜单开着时它断了），firstOrNull 直接吞掉。
+                                onResumeTab = { tab ->
+                                    liveSessions.firstOrNull { it.tabId == tab.tabId }?.let { existing ->
+                                        if (existing.state == LinkState.RECONNECTING) {
+                                            retryNudge.update { it + 1 }
+                                        }
+                                        activeTabId = existing.tabId
+                                        navController.navigate("terminal") { launchSingleTop = true }
+                                    }
+                                },
                                 onConnect = { session ->
                                     // Already connected from this saved session? Jump back into
                                     // the existing live tab instead of dialing a second connection.

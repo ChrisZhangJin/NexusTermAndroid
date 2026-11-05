@@ -22,6 +22,10 @@ import androidx.compose.ui.unit.dp
  * mirror [TerminalKeyBar]'s PAGES and sticky-modifier handling.
  */
 private val HELP_SECTIONS = listOf(
+    "连接列表" to listOf(
+        "连接列表里把一整行向左滑：露出「文件 / 编辑 / 删除」（已连接时还有「新标签」），向右滑或点这一行收回",
+        "删除要再确认一次；点「连接」后按钮置灰、整行有条纹动画，表示正在连接；一条连接开了多个标签时，「断开」「回到会话」都会让你选哪一个",
+    ),
     "终端手势" to listOf(
         "双指捏合：缩放字体（8–28 号），每捏开或捏拢一段距离跳一号",
         "双指按住不动 0.8 秒后抬起：打开菜单（粘贴、清屏、滑至底部、字体还原、虚拟大窗口、SFTP 文件管理、断开）；震动后若继续捏合或拖动，仍按捏合 / 切换卡片处理",
