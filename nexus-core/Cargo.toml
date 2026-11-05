@@ -1,6 +1,6 @@
 [package]
 name = "nexus-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "NexusTerm Android 的 Rust SSH/SFTP 核心（从 NexusTerm 桌面版 fork）"
 authors = ["chris"]
 edition = "2021"
