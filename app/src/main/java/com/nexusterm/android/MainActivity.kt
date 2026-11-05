@@ -615,7 +615,7 @@ class MainActivity : ComponentActivity() {
                         context = this@MainActivity,
                         titles = live.map { it.second },
                         liveSessionIds = live.map { it.third },
-                        reconnecting = live.count { it.first == LinkState.RECONNECTING },
+                        reconnecting = live.map { it.first == LinkState.RECONNECTING },
                     )
                     // Asked on the first connect rather than at launch, so the
                     // prompt shows up with an obvious reason attached.
