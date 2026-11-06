@@ -256,14 +256,26 @@
     if (!n) return;
     wheelRest -= n * step;
     var target = term.element.querySelector(".xterm-screen") || term.element;
-    for (var i = Math.abs(n); i > 0; i--) {
-      target.dispatchEvent(new WheelEvent("wheel", {
-        bubbles: true, cancelable: true, clientX: x, clientY: y,
-        // Finger down = older content = wheel up (negative).
-        deltaY: n > 0 ? -1 : 1, deltaMode: WheelEvent.DOM_DELTA_LINE,
-      }));
+    // xterm turns these wheel events into arrow keys / mouse reports through
+    // onData -> sendInput, synchronously. That is the program scrolling, not
+    // the user typing, so it must not open the follow-the-cursor window (see
+    // sendInput): the redraw that follows parks the cursor at the far right
+    // of the wide canvas (full-width lines, tmux's status line) and
+    // revealCursor would pan the view there.
+    wheelInput = true;
+    try {
+      for (var i = Math.abs(n); i > 0; i--) {
+        target.dispatchEvent(new WheelEvent("wheel", {
+          bubbles: true, cancelable: true, clientX: x, clientY: y,
+          // Finger down = older content = wheel up (negative).
+          deltaY: n > 0 ? -1 : 1, deltaMode: WheelEvent.DOM_DELTA_LINE,
+        }));
+      }
+    } finally {
+      wheelInput = false;
     }
   }
+  var wheelInput = false;
 
   var flingFrame = 0;
 
@@ -635,7 +647,7 @@
     // Typing is what the virtual window follows the cursor for -- output
     // alone (a `top` repainting the whole screen) must not yank the view
     // around, so cursor moves only count for a moment after input.
-    followCursorUntil = Date.now() + 1500;
+    if (!wheelInput) followCursorUntil = Date.now() + 1500;
     noteActivity();
     if (window.NexusAndroid && window.NexusAndroid.onTermInput) {
       window.NexusAndroid.onTermInput(data);
