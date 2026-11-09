@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<!-- 纵深防御：页面自身不允许内联脚本 / 外部脚本；只能连回同源（/doc-meta、/doc），iframe 只能是同源 /doc-html。 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; media-src blob:; connect-src 'self'; frame-src 'self'; font-src data:; object-src 'none'; form-action 'none'; base-uri 'none'">
+<title>浏览</title>
+<link rel="stylesheet" href="vendor/hljs-github.css">
+<link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+<div id="app" class="rd-root"><div class="rd-loading">加载中…</div></div>
+<script src="vendor/polyfill.js"></script>
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
+<script src="viewer.js"></script>
+</body>
+</html>

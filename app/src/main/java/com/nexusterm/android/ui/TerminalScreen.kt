@@ -86,8 +86,12 @@ class TerminalHandle internal constructor(
     var fontSize: Int = fontSize
         private set
 
-    /** Whether this tab is in the [VIRTUAL_WINDOW_COLS]-wide virtual window. Not persisted. */
-    var virtualWindow: Boolean = false
+    /**
+     * Whether this tab is in the [VIRTUAL_WINDOW_COLS]-wide virtual window. On by
+     * default (applied to the page in [markPageReady]); the per-tab toggle is not
+     * persisted, so a new tab starts wide again.
+     */
+    var virtualWindow: Boolean = true
         private set
 
     // `window.NexusTerm` only exists once index.html's inline <script> has
@@ -106,6 +110,9 @@ class TerminalHandle internal constructor(
             pending.forEach { sendNow(it) }
             pending.clear()
         }
+        // 页面脚本此刻才存在，默认值只能在这里推给 JS；晚于上面的 flush 没关系，
+        // 之后 fit 会按 160 列上报给远端 pty。
+        if (virtualWindow) setVirtualWindow(true)
         if (focusWhenReady) {
             focusWhenReady = false
             focusNow()
@@ -258,6 +265,20 @@ class TerminalHandle internal constructor(
 
     @Volatile private var focusWhenReady = false
 
+    /**
+     * 切换器打开时把按键从终端手里收回来。输入法在 Activity.dispatchKeyEvent 之前
+     * 先看到硬键盘按键：textarea 还聚焦着，输入法就可能把 Enter 当成提交 / 编辑器
+     * 动作吞掉（方向键它不管，所以左右能切、Enter 选不了）。把焦点和输入连接撤掉，
+     * 按键才会原样走到 MainActivity.dispatchKeyEvent。关掉切换器后由调用方重新
+     * [focusForHardwareKeys]。
+     */
+    fun releaseKeyFocus() {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.blurForSwitcher && window.NexusTerm.blurForSwitcher();", null)
+        webView.clearFocus()
+        val imm = webView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+        imm?.hideSoftInputFromWindow(webView.windowToken, 0)
+    }
+
     private fun focusNow() {
         webView.requestFocus()
         webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.focusForHardwareKeys();", null)
@@ -293,6 +314,19 @@ class TerminalHandle internal constructor(
         webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.getSelection() : ''") { raw ->
             val text = runCatching { JSONArray("[$raw]").optString(0, "") }.getOrDefault("")
             onText(if (raw == "null") "" else text)
+        }
+    }
+
+    /**
+     * 终端菜单「浏览」的候选（见 index.html 的 NexusTerm.viewTarget）：[onResult] 收到
+     * (选区文字, 落点词)，都是原始文字，取舍交给 [pickViewTarget]。([x], [y]) 是页面坐标（dp）；
+     * [usePoint] = false 时不取落点词（键盘打开的菜单没有手指落点）。只读，不碰选区。
+     * 页面还没起来 / 结果解不出来都按两个空串回调，菜单项就保持不可用。
+     */
+    fun readViewTarget(x: Float, y: Float, usePoint: Boolean, onResult: (selection: String, word: String) -> Unit) {
+        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.viewTarget($x, $y, $usePoint) : ''") { raw ->
+            val o = runCatching { JSONObject(JSONArray("[$raw]").optString(0, "")) }.getOrNull()
+            onResult(o?.optString("sel", "").orEmpty(), o?.optString("word", "").orEmpty())
         }
     }
 

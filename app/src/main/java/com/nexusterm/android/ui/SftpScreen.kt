@@ -48,6 +48,7 @@ import com.nexusterm.android.ssh.SessionStore
 import com.nexusterm.android.ssh.SftpClient
 import com.nexusterm.android.ssh.SftpProgressListenerImpl
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import uniffi.nexus_core.AuthMethod
 import uniffi.nexus_core.RemoteEntry
@@ -114,6 +115,8 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
     var selectedLocal by remember { mutableStateOf<DocumentFile?>(null) }
 
     var transfer by remember { mutableStateOf<TransferProgress?>(null) }
+    // 「浏览」正在读文件：读 50MB 的图片要几秒，期间防止连点开出好几个窗口
+    var viewing by remember { mutableStateOf(false) }
 
     fun openLocalRoot(uri: Uri): Boolean {
         val root = runCatching { DocumentFile.fromTreeUri(context, uri) }.getOrNull()
@@ -319,6 +322,42 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                                 }
                             }
                         },
+                        viewing = viewing,
+                        onView = { entry ->
+                            val hid = handleId
+                            val kind = viewableKind(entry.path)
+                            when {
+                                hid == null -> notice = "尚未连接到远程主机"
+                                entry.isDir -> notice = "「${entry.name}」是目录，无法浏览"
+                                kind == null -> notice = UNSUPPORTED_VIEW_MESSAGE
+                                else -> scope.launch {
+                                    viewing = true
+                                    val opening = "正在打开「${entry.name}」…"
+                                    notice = opening
+                                    try {
+                                        val bytes = SftpClient.read(hid, entry.path, maxBytes(kind))
+                                        val rec = session
+                                        val source = (if (rec != null) "${rec.username}@${rec.host}:" else "") + entry.path
+                                        ViewerLauncher.open(context, entry.name, source, kind, bytes)
+                                        // 别抹掉期间出现的其它提示
+                                        if (notice == opening) notice = null
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        // SftpException 自带中文（含「文件超过 N MB，不适合浏览」）；
+                                        // IOException 是临时文件写盘失败
+                                        val text = (e as? SftpException)?.friendlyText() ?: e.message ?: "未知错误"
+                                        notice = if (isDirectoryError(text)) {
+                                            directoryViewMessage(entry.name)
+                                        } else {
+                                            "浏览失败：${localizeRemoteError(text)}"
+                                        }
+                                    } finally {
+                                        viewing = false
+                                    }
+                                }
+                            }
+                        },
                         onDelete = { entry ->
                             val hid = handleId ?: return@RemotePane
                             scope.launch {
@@ -462,6 +501,8 @@ private fun RemotePane(
     onOpenDir: (RemoteEntry) -> Unit,
     onSelectFile: (RemoteEntry) -> Unit,
     onDownload: (RemoteEntry) -> Unit,
+    viewing: Boolean,
+    onView: (RemoteEntry) -> Unit,
     onDelete: (RemoteEntry) -> Unit,
 ) {
     Column(Modifier.fillMaxSize()) {
@@ -494,6 +535,7 @@ private fun RemotePane(
         if (selected != null) {
             Row(modifier = Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { onDownload(selected) }) { Text("下载到本地当前目录") }
+                TextButton(onClick = { onView(selected) }, enabled = !viewing) { Text("浏览") }
                 TextButton(onClick = { onDelete(selected) }) { Text("删除") }
             }
         }
@@ -617,4 +659,17 @@ private suspend fun downloadViaTempFile(
         temp.delete()
         onUpdate(TransferProgress("", label, 0, 0, error = e.message ?: "启动下载失败", done = true))
     }
+}
+
+/**
+ * UniFFI 生成的 `message` 对带字段的变体是 `"v1=…"`，不能给用户看；
+ * 字段里 nexus-core 已经放好了成句的中文（见 sftp/mod.rs 的 `SftpError`）。
+ */
+private fun SftpException.friendlyText(): String = when (this) {
+    is SftpException.Connect -> v1
+    is SftpException.Auth -> v1
+    is SftpException.Subsystem -> "服务器未启用 SFTP 子系统: $v1"
+    is SftpException.Remote -> v1
+    is SftpException.NotFound -> "连接不存在: $v1"
+    is SftpException.Cancelled -> "传输已取消"
 }

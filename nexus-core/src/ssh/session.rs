@@ -239,6 +239,20 @@ mod cat_tests {
         assert_eq!(cat_command("~/d/r.md"), "cat -- \"$HOME\"/'d/r.md'");
         assert_eq!(cat_command("/x/$(rm -rf).md"), "cat -- '/x/$(rm -rf).md'");
     }
+
+    #[test]
+    fn tilde_alone_and_dashes() {
+        assert_eq!(cat_command("~"), "cat -- \"$HOME\"");
+        // `--` 之后的 `-x` 被当作文件名，不是选项
+        assert_eq!(cat_command("-x.md"), "cat -- '-x.md'");
+    }
+
+    #[tokio::test]
+    async fn read_file_unknown_session_is_not_found() {
+        let m = super::SessionManager::new();
+        let r = m.read_file("nope", "/etc/hostname", 1024).await;
+        assert!(matches!(r, Err(super::SessionError::NotFound(_))));
+    }
 }
 
 /// 探测结果：KEY=VALUE 原样回传，由前端解释（规则改动不必重编 Rust）
@@ -587,30 +601,38 @@ impl SessionManager {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
-    /// 在同一连接上开 exec 通道 `cat` 一个文件（阅读窗口用，不依赖 SFTP 子系统）。
+    /// 在同一连接上开 exec 通道 `cat` 一个文件（浏览窗口用，不依赖 SFTP 子系统）。
     /// `path` 为绝对路径或 `~/` 开头；超过 `max` 字节即中止。
+    ///
+    /// 与 `probe` 同属旁路通道：兼容模式（`sidecar` 关）下一条额外通道都不开，直接
+    /// 返回 [`SIDECAR_OFF`]；服务端明确拒绝开通道则返回 [`SIDECAR_DENIED`]。
     pub async fn read_file(
         &self,
         id: &str,
         path: &str,
         max: usize,
     ) -> Result<Vec<u8>, SessionError> {
-        let handle = {
+        let (handle, sidecar, last_sidecar) = {
             let map = self.inner.lock();
-            map.get(id)
-                .ok_or_else(|| SessionError::NotFound(id.into()))?
-                .handle
-                .clone()
+            let rt = map
+                .get(id)
+                .ok_or_else(|| SessionError::NotFound(id.into()))?;
+            (rt.handle.clone(), rt.sidecar, rt.last_sidecar.clone())
         };
+        // 兼容模式：同 run_sidecar，一条额外通道都不开（堡垒机会因此掐断整条连接）。
+        if !sidecar {
+            return Err(SessionError::Channel(SIDECAR_OFF.into()));
+        }
+        last_sidecar.store(epoch_ms(), std::sync::atomic::Ordering::Relaxed);
         let cmd = cat_command(path);
         let run = async move {
             let mut ch = handle
                 .channel_open_session()
                 .await
-                .map_err(|e| SessionError::Channel(e.to_string()))?;
+                .map_err(|e| SessionError::Channel(sidecar_error(&e)))?;
             ch.exec(true, cmd.as_bytes())
                 .await
-                .map_err(|e| SessionError::Channel(e.to_string()))?;
+                .map_err(|e| SessionError::Channel(sidecar_error(&e)))?;
             let mut out = Vec::new();
             let mut err = Vec::new();
             let mut code: Option<u32> = None;
@@ -621,7 +643,7 @@ impl SessionManager {
                         if out.len() > max {
                             let _ = ch.close().await;
                             return Err(SessionError::Channel(format!(
-                                "文件超过 {} MB，不适合阅读",
+                                "文件超过 {} MB，不适合浏览",
                                 max / 1024 / 1024
                             )));
                         }

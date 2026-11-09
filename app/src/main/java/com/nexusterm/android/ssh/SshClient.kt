@@ -12,6 +12,7 @@ import uniffi.nexus_core.connect as uniffiConnect
 import uniffi.nexus_core.disconnect as uniffiDisconnect
 import uniffi.nexus_core.probe as uniffiProbe
 import uniffi.nexus_core.resize as uniffiResize
+import uniffi.nexus_core.sshReadFile as uniffiSshReadFile
 import uniffi.nexus_core.write as uniffiWrite
 
 /**
@@ -70,6 +71,19 @@ object SshClient {
     suspend fun probe(sessionId: String): Map<String, String> = withContext(Dispatchers.IO) {
         uniffiProbe(sessionId)
     }
+
+    /**
+     * 经旁路 exec 通道 `cat -- <path>` 读远端文件（「浏览」用，不依赖 SFTP）。需要连接时
+     * `sidecar = true`。`path` 为绝对路径或 `~/` 开头。累计超过 [max] 字节即中止。
+     *
+     * @throws SessionException `Channel` 且文本含「并行通道」= 服务器拒绝第二条通道（堡垒机）；
+     *   含「兼容模式」= 本连接没开旁路；其余文本（文件超限 / `cat` 的 stderr / 读取超时）可直接展示；
+     *   `NotFound` = 会话已不在。
+     */
+    suspend fun readFile(sessionId: String, path: String, max: Long): ByteArray =
+        withContext(Dispatchers.IO) {
+            uniffiSshReadFile(sessionId, path, max.toULong())
+        }
 
     // 每次按键都是一个独立协程；全都跳到 Dispatchers.IO 的线程池上并发写，先发的可能后到
     // （快速输入把 "export" 敲成 "expotr"，历史面板的「粘贴 + 回车」让回车跑到粘贴前面）。

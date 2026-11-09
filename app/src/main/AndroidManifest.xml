@@ -70,6 +70,19 @@
         </activity>
 
         <!--
+          「浏览」窗口（Markdown / HTML / 图片 / 音视频 / 文本）。exported=false：文档内容
+          经进程内的 ViewerDocStore 传递，Intent 里只有一个 id，外部应用既拉不起它也读不到文档。
+
+          configChanges：旋转 / 折叠 / 键盘插拔 / 深浅色切换都不该销毁 Activity —— 重建会
+          让 WebView 重新加载，用户正在看的位置、缩放、源码/渲染模式全丢。
+        -->
+        <activity
+            android:name=".ui.ViewerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation|smallestScreenSize|screenLayout|uiMode|density"
+            android:theme="@style/Theme.NexusTermAndroid" />
+
+        <!--
           通知上「全部断开」按钮的接收端。必须在清单里静态注册（而不是
           Context.registerReceiver）：按钮被按下时 MainActivity 很可能已经
           销毁，只有清单注册的 receiver 才能被系统拉起来。

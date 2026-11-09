@@ -12,6 +12,7 @@ import android.view.KeyEvent
 import android.view.KeyboardShortcutGroup
 import android.view.KeyboardShortcutInfo
 import android.view.Menu
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -54,6 +55,20 @@ import com.nexusterm.android.ui.GestureSettingsScreen
 import com.nexusterm.android.ui.KeyChord
 import com.nexusterm.android.ui.LiveTabInfo
 import com.nexusterm.android.ui.LiveTabStatus
+import com.nexusterm.android.ui.SidecarFailure
+import com.nexusterm.android.ui.UNSUPPORTED_VIEW_MESSAGE
+import com.nexusterm.android.ui.VIEW_COMPAT_MODE_MESSAGE
+import com.nexusterm.android.ui.VIEW_NO_CWD_MESSAGE
+import com.nexusterm.android.ui.ViewerLauncher
+import com.nexusterm.android.ui.classifySidecarError
+import com.nexusterm.android.ui.directoryViewMessage
+import com.nexusterm.android.ui.isDirectoryError
+import com.nexusterm.android.ui.localizeRemoteError
+import com.nexusterm.android.ui.isAbsoluteRemotePath
+import com.nexusterm.android.ui.joinCwd
+import com.nexusterm.android.ui.maxBytes
+import com.nexusterm.android.ui.viewFileName
+import com.nexusterm.android.ui.viewableKind
 import com.nexusterm.android.ui.SessionFormInitial
 import com.nexusterm.android.ui.SessionListScreen
 import com.nexusterm.android.ui.SftpScreen
@@ -235,6 +250,8 @@ private class LiveSession(
     var liveSessionId: String,
     val savedSessionId: String,
     val displayName: String,
+    /** `user@host`：「浏览」打开的文档在 viewer 里显示的来源前缀。 */
+    val endpoint: String = "",
 ) {
     /**
      * Created once, right after `connect` returns, and kept alive until this
@@ -294,6 +311,9 @@ private class LiveSession(
      * 新登录 shell 此刻还在 $HOME，探到它会把掉线前的真实上下文覆盖掉。
      */
     @Volatile var restoring = false
+
+    /** 正在为终端菜单的「浏览」读文件（只在主线程读写）：读完之前再点一次不重复开。 */
+    var viewingFile = false
 
     /**
      * Appended to the switcher card's title. Status has to reach the UI
@@ -450,6 +470,7 @@ class MainActivity : ComponentActivity() {
                             liveSessionId = "", // filled in once connect() returns, see below
                             savedSessionId = session.id,
                             displayName = session.name.ifBlank { session.host },
+                            endpoint = "${session.username}@${session.host}",
                         )
                         val listener = SessionListenerImpl(
                             onDataCallback = { _, bytes ->
@@ -810,6 +831,10 @@ class MainActivity : ComponentActivity() {
                                             navController.navigate("sftp/${it.savedSessionId}")
                                         }
                                     },
+                                    onViewFile = { id, path ->
+                                        liveSessions.firstOrNull { it.tabId == id }
+                                            ?.let { browseTerminalFile(it, path) }
+                                    },
                                     // 空白 = 清掉自定义名，回到配置名/主机。
                                     onRenameTab = { id, name ->
                                         liveSessions.firstOrNull { it.tabId == id }?.customName =
@@ -1037,6 +1062,87 @@ class MainActivity : ComponentActivity() {
             }
             delay(PROBE_INTERVAL_MS)
         }
+    }
+
+    /**
+     * 终端菜单的「浏览」：把 [path]（相对路径按 shell 当前目录解析）在远端读下来，交给 [ViewerLauncher]。
+     * 桌面版 TerminalView.doView 的移植：绝对 / `~/` 路径直接读；相对路径先经旁路通道探测 cwd。
+     *
+     * 读文件走的是终端自己这条连接的旁路 exec 通道（`cat`，见 [SshClient.readFile]）：全程在
+     * IO 线程，不碰终端的输入通道，也绝不往终端里写东西。堡垒机拒绝并行通道时同 [probeLoop]：
+     * 把配置记入 [SidecarPrefs]（之后的连接不再开旁路），本次只提示，用 SFTP 面板的「浏览」仍可用。
+     */
+    private fun browseTerminalFile(live: LiveSession, path: String) {
+        if (live.viewingFile) return
+        val kind = viewableKind(path)
+        if (kind == null) {
+            toast(UNSUPPORTED_VIEW_MESSAGE, long = true)
+            return
+        }
+        if (live.disposed || live.state != LinkState.CONNECTED) {
+            toast("连接已断开，无法浏览")
+            return
+        }
+        live.viewingFile = true
+        lifecycleScope.launch {
+            try {
+                val sessionId = live.liveSessionId
+                var full = path
+                if (!isAbsoluteRemotePath(path)) {
+                    var cwd: String? = null
+                    var probeFailure = SidecarFailure.OTHER
+                    try {
+                        cwd = parseProbe(SshClient.probe(sessionId), System.currentTimeMillis())?.cwd
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        probeFailure = classifySidecarError(sidecarErrorText(e))
+                        if (probeFailure == SidecarFailure.DENIED) SidecarPrefs.markDenied(this@MainActivity, live.savedSessionId)
+                    }
+                    if (cwd == null) {
+                        // 兼容模式下探测目录本来就会被拒绝，说清原因，别让人以为是 bug。
+                        toast(
+                            if (probeFailure == SidecarFailure.OTHER) VIEW_NO_CWD_MESSAGE else VIEW_COMPAT_MODE_MESSAGE,
+                            long = true,
+                        )
+                        return@launch
+                    }
+                    full = joinCwd(cwd, path)
+                }
+                val name = viewFileName(full)
+                toast("正在打开「$name」…")
+                val bytes = SshClient.readFile(sessionId, full, maxBytes(kind))
+                val source = (if (live.endpoint.isNotEmpty()) "${live.endpoint}:" else "") + full
+                ViewerLauncher.open(this@MainActivity, name, source, kind, bytes)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val text = sidecarErrorText(e)
+                val msg = when (classifySidecarError(text)) {
+                    SidecarFailure.DENIED -> {
+                        SidecarPrefs.markDenied(this@MainActivity, live.savedSessionId)
+                        "服务器不支持并行通道，无法从终端浏览；可在 SFTP 文件管理里浏览"
+                    }
+                    SidecarFailure.OFF -> "该连接处于兼容模式（服务器不支持并行通道），无法从终端浏览；可在 SFTP 文件管理里浏览"
+                    // 文件超限 / cat 的 stderr / 超时都自带中文；IOException 是临时文件写盘失败。
+                    SidecarFailure.OTHER -> (e as? SessionException)?.friendlyText() ?: e.message ?: "未知错误"
+                }
+                toast(
+                    if (isDirectoryError(msg)) directoryViewMessage(viewFileName(path)) else "浏览失败：${localizeRemoteError(msg)}",
+                    long = true,
+                )
+            } finally {
+                live.viewingFile = false
+            }
+        }
+    }
+
+    /** 同时看 message 和 Channel 的载荷（见 [probeLoop]：文案放在哪个字段上以绑定为准）。 */
+    private fun sidecarErrorText(e: Exception): String =
+        e.message.orEmpty() + ((e as? SessionException.Channel)?.v1.orEmpty())
+
+    private fun toast(text: String, long: Boolean = false) {
+        Toast.makeText(this, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
     }
 
     /**

@@ -252,6 +252,22 @@ pub fn probe(session_id: String) -> Result<std::collections::HashMap<String, Str
     runtime().block_on(manager().probe(&session_id))
 }
 
+/// 经旁路 exec 通道 `cat -- <path>` 读远端文件的全部字节（「浏览」用，不依赖 SFTP 子系统）。
+///
+/// `path` 为绝对路径或 `~/` 开头（`~` 在远端展开，路径整体单引号转义，防注入）。
+/// 累计超过 `max` 字节立即中止并关闭通道，返回 `SshError::Channel("文件超过 N MB，不适合浏览")`；
+/// `cat` 非零退出时返回其 stderr 文本（空则「读取失败（退出码 N）」）；整体 30 秒超时
+/// 「读取文件超时」。
+///
+/// 与 `probe` 同样走旁路通道，需要 `connect(.., sidecar = true)`：兼容模式下返回带
+/// `SIDECAR_OFF` 文案的 `SshError::Channel`（一条额外通道都不开），服务端拒绝开通道则带
+/// `SIDECAR_DENIED` 文案；会话不存在是 `SshError::NotFound`。
+#[uniffi::export]
+pub fn ssh_read_file(session_id: String, path: String, max: u64) -> Result<Vec<u8>, SshError> {
+    let max = usize::try_from(max).unwrap_or(usize::MAX);
+    runtime().block_on(manager().read_file(&session_id, &path, max))
+}
+
 /// 主动断开。幂等：会话已经不存在也不报错——对应用户快速点两下「断开」
 /// 或者 `on_closed` 已经先一步把它收尾的竞态。
 #[uniffi::export]
@@ -262,6 +278,13 @@ pub fn disconnect(session_id: String) {
 #[cfg(test)]
 mod smoke_tests {
     use super::*;
+
+    /// 会话不存在 → `NotFound`（不会去开任何通道）。
+    #[test]
+    fn ssh_read_file_unknown_session_is_not_found() {
+        let err = ssh_read_file("not-a-real-session".into(), "/etc/hostname".into(), 1024);
+        assert!(matches!(err, Err(SshError::NotFound(_))));
+    }
 
     /// 确认单例在同一进程内真的只建一次——SessionManager 持有的
     /// known_hosts/auth_prompts 登记表不能每次调用都被悄悄重置。

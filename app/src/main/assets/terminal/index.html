@@ -15,6 +15,7 @@
                    ...and setFontSize / setVirtualCols / pasteBase64 /
                    clearScreen / scrollToBottom / focusForHardwareKeys /
                    getPromptState (read via result callback) /
+                   viewTarget (read via result callback; the menu's 浏览 item) /
                    select*, driven by the
                    gestures and the two-finger-hold menu in
                    ui/TerminalTabsPager.kt.
@@ -72,6 +73,7 @@
 <div id="sel-end" class="sel-handle"></div>
 <script src="xterm/xterm.js"></script>
 <script src="xterm/addon-fit.js"></script>
+<script src="viewtarget.js"></script>
 <script>
 (function () {
   // The size the user last pinched to is remembered on the Kotlin side
@@ -848,6 +850,25 @@
       return JSON.stringify({ text: text, cursorX: buf.cursorX, cols: term.cols });
     },
 
+    /**
+     * 终端菜单的「浏览」要的两个候选，JSON 字符串 {sel, word}（读取，不改任何状态）：
+     *  - sel：当前选区的文字（没有 / 超过 4096 字符 = ""）。是否单行、能不能当文件，
+     *    由 Kotlin 侧判断（ui/RemoteViewPath.kt），这里不做；
+     *  - word：(x, y) 这个页面坐标下的「词」，usePoint 为 false（菜单是键盘打开的，
+     *    没有手指落点）时恒为 ""。取词的规则见 viewtarget.js。
+     * 两者都只是原始文字：选区优先还是落点词优先、requireExt 之类的取舍都在 Kotlin 一处。
+     */
+    viewTarget: function (x, y, usePoint) {
+      var sel = term.hasSelection() ? term.getSelection() : "";
+      if (sel.length > 4096) sel = "";
+      var word = "";
+      if (usePoint && window.NexusViewTarget) {
+        var p = cellAt(x, y);
+        word = window.NexusViewTarget.wordAt(term.buffer.active, p.row, p.col, term.cols) || "";
+      }
+      return JSON.stringify({ sel: sel, word: word });
+    },
+
     scrollToBottom: function () {
       stopFling();
       term.scrollToBottom();
@@ -865,6 +886,12 @@
     focusForHardwareKeys: function () {
       var ta = term.textarea;
       if (ta && document.activeElement !== ta) ta.focus({ preventScroll: true });
+    },
+
+    /** 会话切换器打开：撤掉 textarea 的 DOM 焦点，输入法不再抢硬键盘的 Enter。 */
+    blurForSwitcher: function () {
+      var ta = term.textarea;
+      if (ta && document.activeElement === ta) ta.blur();
     },
 
     /**

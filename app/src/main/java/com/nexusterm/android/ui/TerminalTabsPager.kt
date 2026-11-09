@@ -293,6 +293,8 @@ fun TerminalTabsPager(
     onCloseTab: (String) -> Unit,
     /** "SFTP 文件管理" in the terminal menu, for the tab with this id. */
     onOpenSftp: (String) -> Unit,
+    /** 终端菜单的「浏览」：`(tab id, 清理过的远端路径，可能是相对路径)`，读取与打开由调用方做。 */
+    onViewFile: (tabId: String, path: String) -> Unit = { _, _ -> },
     /**
      * 用户在转盘上改了名字：`(tab id, 新名字)`。已 trim，空串 = 清掉自定义名、
      * 回到原来的名字，由调用方解释。名字只在内存里，不落盘。
@@ -386,6 +388,8 @@ fun TerminalTabsPager(
 
     // Where the terminal menu is anchored, or null when it's closed.
     var menuAt by remember { mutableStateOf<Offset?>(null) }
+    // 菜单是不是键盘打开的：键盘没有手指落点，「浏览」就不去取落点下的词（见 TerminalMenu）。
+    var menuByKeyboard by remember { mutableStateOf(false) }
 
     // The span the pinch last stepped the font at; see PinchStepPerFontSize.
     var pinchRefSpan by remember { mutableFloatStateOf(0f) }
@@ -514,6 +518,20 @@ fun TerminalTabsPager(
     // 切换器打开的那一刻记下当前标签，见 switcherOriginId。
     LaunchedEffect(isOpen) { if (isOpen) switcherOriginId = activeTabIdNow }
 
+    // 有硬键盘时，打开切换器就让终端交出输入焦点（见 releaseKeyFocus：否则输入法可能
+    // 吞掉 Enter）；收起来再还回去，触摸选卡片也一样。Enter / Esc 路径自己也会发起一次，
+    // 重复无害。第一次组合时 isOpen=false 且还没打开过，不要凭空抢焦点。
+    var switcherWasOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(isOpen) {
+        if (isOpen) {
+            switcherWasOpen = true
+            if (hasHardKeyboard) activeHandle.releaseKeyFocus()
+        } else if (switcherWasOpen) {
+            switcherWasOpen = false
+            if (hasHardKeyboard) hardKeyFocusRequest++
+        }
+    }
+
     // 断开确认只在「刚按过那一下、卡片还是它」时有效：超时、切换器收起、转盘转到别的卡片
     // （滑动 / 点名字 / 键盘都算）都撤销。上膛时 closeArm 是新值，effect 重启、重新计时。
     LaunchedEffect(closeArm) {
@@ -603,8 +621,10 @@ fun TerminalTabsPager(
                 }
             }
             // 菜单本来锚在手指落点，键盘没有落点，取终端区域的中心。
-            ShortcutAction.OPEN_MENU ->
+            ShortcutAction.OPEN_MENU -> {
+                menuByKeyboard = true
                 menuAt = Offset(areaSize.width / 2f, areaSize.height / 2f)
+            }
             ShortcutAction.TOGGLE_KEY_BAR -> toggleKeyBar()
             // 手势那边拆成开、关两个动作；键盘是一键一次切换，读的是和菜单同一份状态。
             ShortcutAction.TOGGLE_WIDE_WINDOW -> activeHandle.setVirtualWindow(!activeHandle.virtualWindow)
@@ -737,7 +757,10 @@ fun TerminalTabsPager(
                 // The buzz comes at the end of the hold, the action only at the
                 // lift: see Touch.HOLD_ARMED for why the two are split.
                 onHoldArmed = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) },
-                onMenu = { menuAt = it },
+                onMenu = {
+                    menuByKeyboard = false
+                    menuAt = it
+                },
                 // Pointer positions are relative to this Box, whose top-left is
                 // also the WebView's (the pager is only inset at the bottom),
                 // and a page px in the WebView is one dp.
@@ -1022,6 +1045,9 @@ fun TerminalTabsPager(
                 onPaste = { pasteFromClipboard() },
                 onShowHelp = { showHelp = true },
                 onShowHistory = { showHistory = true },
+                // 坐标换算同 onSelectStart：菜单锚点是这个 Box 的 px，页面里 1 px = 1 dp。
+                viewPoint = if (menuByKeyboard) null else Offset(at.x / density, at.y / density),
+                onView = { path -> onViewFile(tabs[activeIndex].id, path) },
                 onOpenSftp = { onOpenSftp(tabs[activeIndex].id) },
                 onDisconnect = { onCloseTab(tabs[activeIndex].id) },
             )
@@ -1354,9 +1380,21 @@ private fun TerminalMenu(
     onPaste: () -> Unit,
     onShowHelp: () -> Unit,
     onShowHistory: () -> Unit,
+    /** 落点的页面坐标（dp）；null = 键盘打开的菜单，没有落点，只看选区。 */
+    viewPoint: Offset?,
+    onView: (String) -> Unit,
     onOpenSftp: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
+    // 「浏览」的目标在菜单打开时向页面问一次（异步，几毫秒）：选区优先，其次落点下的词，
+    // 规则见 pickViewTarget。回来之前、或没有可浏览的文件时，这一项是灰的「浏览」，
+    // 不让菜单高度在结果回来时跳变。
+    var viewPath by remember(anchor) { mutableStateOf<String?>(null) }
+    LaunchedEffect(anchor) {
+        handle.readViewTarget(viewPoint?.x ?: 0f, viewPoint?.y ?: 0f, viewPoint != null) { sel, word ->
+            viewPath = pickViewTarget(sel, word)
+        }
+    }
     // A zero-size box at the touch point, so the menu opens where the
     // fingers were rather than at the corner of the screen.
     Box(Modifier.offset { IntOffset(anchor.x.roundToInt(), anchor.y.roundToInt()) }) {
@@ -1401,6 +1439,18 @@ private fun TerminalMenu(
                 onClick = { onDismiss(); onShowHelp() },
             )
             HorizontalDivider()
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        viewPath?.let { "浏览「${viewFileName(it)}」" } ?: "浏览",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 220.dp),
+                    )
+                },
+                enabled = viewPath != null,
+                onClick = { val p = viewPath; onDismiss(); if (p != null) onView(p) },
+            )
             DropdownMenuItem(
                 text = { Text("SFTP 文件管理") },
                 onClick = { onDismiss(); onOpenSftp() },
