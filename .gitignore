@@ -25,3 +25,5 @@ app/build/generated/
 # Debug log captures (device logcat dumps, not source)
 logcat-*.txt
 debug-context.txt
+.nanopi/agents/
+.nanopi/worktrees/
