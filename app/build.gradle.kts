@@ -12,8 +12,8 @@ android {
         applicationId = "com.nexusterm.android"
         minSdk = 26 // WebView byte[]/evaluateJavascript needs API 19+; 26 picked for Compose + modern TLS defaults
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.3"
+        versionCode = 5
+        versionName = "0.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
