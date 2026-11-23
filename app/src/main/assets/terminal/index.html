@@ -73,6 +73,7 @@
 <div id="sel-end" class="sel-handle"></div>
 <script src="xterm/xterm.js"></script>
 <script src="xterm/addon-fit.js"></script>
+<script src="xterm/addon-search.js"></script>
 <script src="viewtarget.js"></script>
 <script>
 (function () {
@@ -94,12 +95,34 @@
       selectionBackground: "rgba(93, 202, 165, 0.45)",
     },
     scrollback: 5000,
+    // registerDecoration (find highlights, marks) is still a "proposed" API in xterm 5.5.
+    allowProposedApi: true,
   });
   var fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   var host = document.getElementById("terminal");
   term.open(host);
   fitAddon.fit();
+
+  // Search is optional: a missing/incompatible addon must never black out SSH.
+  // Pin the WebView-87-compatible build documented in xterm/README-search.md.
+  var searchAddon = null;
+  try {
+    var candidate = new SearchAddon.SearchAddon({ highlightLimit: 2000 });
+    term.loadAddon(candidate);
+    candidate.onDidChangeResults(function (r) {
+      reportSearch(r.resultIndex, r.resultCount);
+    });
+    searchAddon = candidate;
+  } catch (e) {
+    console.warn("Terminal search unavailable", e);
+  }
+
+  function reportSearch(index, count) {
+    if (window.NexusAndroid && window.NexusAndroid.onSearchResult) {
+      window.NexusAndroid.onSearchResult(index, count);
+    }
+  }
 
   /** Current cell size in CSS px -- the same private field the fit addon reads. */
   function cell() {
@@ -526,6 +549,10 @@
 
   // Output scrolling the viewport moves the selected text; the handles follow.
   term.onScroll(placeHandles);
+  // Scrolling into history / a resize moves the input rows: re-report so the
+  // completion strip hides or follows.
+  term.onScroll(scheduleLineReport);
+  term.onResize(scheduleLineReport);
 
   // ---- Sticky Ctrl/Alt ----
   // The extra-keys row (ui/TerminalKeyBar.kt) arms these with a tap and the
@@ -606,6 +633,7 @@
     promptAt = (PROMPT_TAIL.test(before) && after.trim() === "")
       ? { row: row, x: buf.cursorX, text: before }
       : null;
+    scheduleLineReport();
   }
 
   function captureCommand() {
@@ -635,6 +663,63 @@
     if (cmd) window.NexusAndroid.onCommand(cmd);
   }
 
+  // ---- Input line, for the completion strip ----
+  // What the user has typed after the prompt (read off the screen like
+  // captureCommand, so tab completion / IME commits / Up-arrow recalls are all
+  // seen as the shell drew them), plus where those rows sit on the page so the
+  // strip can float just above them. Reported to Kotlin a moment after input or
+  // output settles, only when it changed. "Unknown" (no prompt seen, a TUI on
+  // the alternate screen, scrolled into history, cursor not at the end of the
+  // line) is reported as known=false and hides the strip.
+  var lineTimer = null;
+  var lastLineKey = "";
+
+  function scheduleLineReport() {
+    if (lineTimer) clearTimeout(lineTimer);
+    lineTimer = setTimeout(reportLine, 120);
+  }
+
+  function readInputLine() {
+    var p = promptAt;
+    var buf = term.buffer.active;
+    if (!p || buf.type !== "normal" || buf.viewportY !== buf.baseY) return null;
+    var cur = buf.baseY + buf.cursorY;
+    if (cur < p.row || cur - p.row > 30) return null;
+    var first = buf.getLine(p.row);
+    if (!first || first.translateToString(false, 0, p.x) !== p.text) return null;
+    var text = "";
+    for (var r = p.row; r <= cur; r++) {
+      var line = buf.getLine(r);
+      if (!line || (r > p.row && !line.isWrapped)) return null;
+      var from = r === p.row ? p.x : 0;
+      text += r === cur ? line.translateToString(false, from, buf.cursorX) : line.translateToString(false, from);
+    }
+    // Only when the cursor is at the end of what is typed: completing in the
+    // middle of a line would splice the suggestion into the wrong place.
+    var curLine = buf.getLine(cur);
+    var next = buf.getLine(cur + 1);
+    if (curLine.translateToString(true, buf.cursorX) !== "" ||
+        (next && next.isWrapped && next.translateToString(true) !== "")) return null;
+    var rect = screenRect();
+    var h = cell().height;
+    return {
+      text: text,
+      top: rect.top + (p.row - buf.viewportY) * h,
+      bottom: rect.top + (cur - buf.viewportY + 1) * h,
+    };
+  }
+
+  function reportLine() {
+    lineTimer = null;
+    if (!window.NexusAndroid || !window.NexusAndroid.onInputLine) return;
+    var l = readInputLine();
+    var key = l ? l.text + "\u0000" + Math.round(l.top) + "," + Math.round(l.bottom) : "";
+    if (key === lastLineKey) return;
+    lastLineKey = key;
+    if (l) window.NexusAndroid.onInputLine(true, l.text, l.top, l.bottom);
+    else window.NexusAndroid.onInputLine(false, "", 0, 0);
+  }
+
   function noteInputForHistory(data) {
     if (data === "\r") captureCommand();
     else if (data === "\x03" || data === "\x04" || data === "\x0c") {
@@ -646,6 +731,7 @@
 
   function sendInput(data) {
     noteInputForHistory(data);
+    scheduleLineReport();
     // Typing is what the virtual window follows the cursor for -- output
     // alone (a `top` repainting the whole screen) must not yank the view
     // around, so cursor moves only count for a moment after input.
@@ -685,6 +771,180 @@
   // request on the Rust side -- see SshClient.kt).
   reportSize();
 
+
+  // ---- Search ----
+  // The result count arrives asynchronously (the addon paints its highlights
+  // on a timer), so it is pushed to Kotlin instead of returned from find().
+  var FIND_DECO = {
+    matchBackground: "#5a4a10",
+    matchBorder: "#c9a227",
+    matchOverviewRuler: "#c9a227",
+    activeMatchBackground: "#ff9632",
+    activeMatchBorder: "#ffffff",
+    activeMatchColorOverviewRuler: "#ff9632",
+  };
+
+  // ---- Marks (keyword highlighting) ----
+  // Ported from the desktop app's src/lib/highlight.ts: every hit in the whole
+  // buffer, scrollback included, gets a coloured background, and new output is
+  // re-scanned on its own. Matching is per *logical* line (wrapped rows are
+  // joined, so a keyword split by a wrap still hits) and cells are mapped back
+  // one by one because CJK / emoji take two columns -- a string index is not a
+  // column.
+  var MAX_DECORATIONS = 3000;
+
+  function logicalLines() {
+    var buf = term.buffer.active;
+    var out = [];
+    var start = 0;
+    for (var y = 1; y <= buf.length; y++) {
+      var next = y < buf.length ? buf.getLine(y) : undefined;
+      if (!next || !next.isWrapped) {
+        out.push([start, y - 1]);
+        start = y;
+      }
+    }
+    return out;
+  }
+
+  function expandLines(from, to) {
+    var buf = term.buffer.active;
+    var text = "";
+    var map = [];
+    var cell = buf.getNullCell();
+    for (var y = from; y <= to; y++) {
+      var line = buf.getLine(y);
+      if (!line) continue;
+      for (var x = 0; x < line.length; x++) {
+        line.getCell(x, cell);
+        var w = cell.getWidth();
+        if (w === 0) continue; // right half of a wide char
+        var ch = cell.getChars() || " ";
+        for (var k = 0; k < ch.length; k++) map.push({ row: y, col: x, width: w });
+        text += ch;
+      }
+    }
+    return { text: text, map: map };
+  }
+
+  function roughText(from, to) {
+    var buf = term.buffer.active;
+    var s = "";
+    for (var y = from; y <= to; y++) {
+      var line = buf.getLine(y);
+      s += line ? line.translateToString(y === to) : "";
+    }
+    return s;
+  }
+
+  var marks = {
+    decos: [],
+    rules: [],
+    caseSensitive: false,
+    timer: 0,
+
+    apply: function (rules, cs) {
+      this.rules = rules.filter(function (r) { return r.text && r.text.length > 0; });
+      this.caseSensitive = cs;
+      return this.scan();
+    },
+
+    clear: function () {
+      this.rules = [];
+      this.dispose();
+    },
+
+    /** Debounced re-scan after output / resize; free when no rule is set. */
+    refresh: function () {
+      if (this.rules.length === 0) return;
+      var self = this;
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = setTimeout(function () { self.scan(); }, 250);
+    },
+
+    dispose: function () {
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = 0;
+      for (var i = 0; i < this.decos.length; i++) this.decos[i].dispose();
+      this.decos = [];
+    },
+
+    scan: function () {
+      for (var i = 0; i < this.decos.length; i++) this.decos[i].dispose();
+      this.decos = [];
+      if (this.rules.length === 0) return 0;
+      var buf = term.buffer.active;
+      // The alternate screen (vim / less / tmux) can't carry decorations;
+      // they are painted again on the first scan after it is left.
+      if (buf.type !== "normal") return 0;
+
+      var cs = this.caseSensitive;
+      var norm = function (t) { return cs ? t : t.toLowerCase(); };
+      var needles = this.rules.map(function (r) {
+        return { color: r.color, n: norm(r.text) };
+      });
+      var cursorAbs = buf.baseY + buf.cursorY;
+      var hits = 0;
+      var lines = logicalLines();
+      for (var li = 0; li < lines.length; li++) {
+        var from = lines[li][0], to = lines[li][1];
+        var rough = norm(roughText(from, to));
+        if (!needles.some(function (r) { return rough.indexOf(r.n) >= 0; })) continue;
+        var ex = expandLines(from, to);
+        var hay = norm(ex.text);
+        for (var ni = 0; ni < needles.length; ni++) {
+          var r = needles[ni];
+          var at = hay.indexOf(r.n);
+          while (at >= 0) {
+            hits++;
+            if (this.decos.length < MAX_DECORATIONS) this.paint(ex.map, at, r.n.length, r.color, cursorAbs);
+            at = hay.indexOf(r.n, at + Math.max(1, r.n.length));
+          }
+        }
+      }
+      return hits;
+    },
+
+    /** Paint [start, start+len) of one logical line, one segment per physical row. */
+    paint: function (map, start, len, color, cursorAbs) {
+      var segs = {};
+      var rowsInOrder = [];
+      for (var k = start; k < start + len && k < map.length; k++) {
+        var c = map[k];
+        var end = c.col + c.width;
+        var s = segs[c.row];
+        if (!s) {
+          segs[c.row] = { x0: c.col, x1: end };
+          rowsInOrder.push(c.row);
+        } else {
+          s.x0 = Math.min(s.x0, c.col);
+          s.x1 = Math.max(s.x1, end);
+        }
+      }
+      for (var i = 0; i < rowsInOrder.length; i++) {
+        var row = rowsInOrder[i];
+        var seg = segs[row];
+        var marker = term.registerMarker(row - cursorAbs);
+        if (!marker) continue;
+        var deco = term.registerDecoration({
+          marker: marker,
+          x: seg.x0,
+          width: seg.x1 - seg.x0,
+          backgroundColor: color,
+          foregroundColor: "#111111",
+          layer: "top",
+        });
+        if (deco) {
+          (function (m) { deco.onDispose(function () { m.dispose(); }); })(marker);
+          this.decos.push(deco);
+        } else {
+          marker.dispose();
+        }
+      }
+    },
+  };
+  term.onResize(function () { marks.refresh(); });
+
   // ---- Kotlin -> JS bridge object ----
   // Must be attached to `window` *after* `term` exists, since Kotlin may
   // start calling writeBase64() immediately after the page finishes loading.
@@ -703,7 +963,11 @@
       for (var i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
       }
-      term.write(bytes, schedulePromptMark);
+      term.write(bytes, function () {
+        schedulePromptMark();
+        scheduleLineReport();
+        marks.refresh();
+      });
     },
     notifyClosed: function (reason) {
       term.write("\r\n\x1b[31m[connection closed: " + reason + "]\x1b[0m\r\n");
@@ -851,22 +1115,59 @@
     },
 
     /**
-     * 终端菜单的「浏览」要的两个候选，JSON 字符串 {sel, word}（读取，不改任何状态）：
+     * 终端菜单的「浏览」要的候选，JSON 字符串 {sel, words}（读取，不改任何状态）：
      *  - sel：当前选区的文字（没有 / 超过 4096 字符 = ""）。是否单行、能不能当文件，
      *    由 Kotlin 侧判断（ui/RemoteViewPath.kt），这里不做；
-     *  - word：(x, y) 这个页面坐标下的「词」，usePoint 为 false（菜单是键盘打开的，
-     *    没有手指落点）时恒为 ""。取词的规则见 viewtarget.js。
-     * 两者都只是原始文字：选区优先还是落点词优先、requireExt 之类的取舍都在 Kotlin 一处。
+     *  - words：按优先级排好的「词」：先是 points（页面坐标 [[x, y], …]，手势打开时是
+     *    两指中点 + 每根手指；键盘打开时为空）下的词，每个点允许左右偏几格（wordNear），
+     *    最后是终端光标处的词——光标通常停在刚敲完的词后一格，所以先看左边一格。
+     *    取词的规则见 viewtarget.js；取不到的点不占位。
+     *  - pointWords：words 里前几个来自落点（其余是光标处的词）。「插入」只要落点的词。
+     * 都只是原始文字：选区优先还是落点词优先、requireExt 之类的取舍都在 Kotlin 一处。
+     * 这样不必先选中（有些手机上长按选中会触发系统的其它功能），手指按在文件名上就行。
      */
-    viewTarget: function (x, y, usePoint) {
+    viewTarget: function (points) {
       var sel = term.hasSelection() ? term.getSelection() : "";
       if (sel.length > 4096) sel = "";
-      var word = "";
-      if (usePoint && window.NexusViewTarget) {
-        var p = cellAt(x, y);
-        word = window.NexusViewTarget.wordAt(term.buffer.active, p.row, p.col, term.cols) || "";
+      var words = [];
+      var vt = window.NexusViewTarget;
+      if (vt) {
+        var buf = term.buffer.active;
+        (points || []).forEach(function (pt) {
+          var p = cellAt(pt[0], pt[1]);
+          var w = vt.wordNear(buf, p.row, p.col, term.cols);
+          if (w) words.push(w);
+        });
+        var pointWords = words.length;
+        var cr = buf.baseY + buf.cursorY;
+        var cw = vt.wordAt(buf, cr, buf.cursorX - 1, term.cols) || vt.wordAt(buf, cr, buf.cursorX, term.cols);
+        if (cw) words.push(cw);
       }
-      return JSON.stringify({ sel: sel, word: word });
+      return JSON.stringify({ sel: sel, words: words, pointWords: typeof pointWords === "number" ? pointWords : 0 });
+    },
+
+    /**
+     * 整个缓冲区（含滚动历史）的纯文字，给「阅读模式」。软折行的几行拼回一行（阅读器按手机
+     * 宽度自己换行），行尾空白去掉，末尾的空行去掉。全屏程序里读的是它当前那一屏。
+     */
+    bufferText: function () {
+      var buf = term.buffer.active;
+      var out = [];
+      var cur = "";
+      for (var r = 0; r < buf.length; r++) {
+        var line = buf.getLine(r);
+        if (!line) continue;
+        var next = buf.getLine(r + 1);
+        var more = !!(next && next.isWrapped);
+        cur += line.translateToString(!more);
+        if (!more) {
+          out.push(cur.replace(/\s+$/, ""));
+          cur = "";
+        }
+      }
+      if (cur) out.push(cur.replace(/\s+$/, ""));
+      while (out.length && out[out.length - 1] === "") out.pop();
+      return out.join("\n");
     },
 
     scrollToBottom: function () {
@@ -892,6 +1193,61 @@
     blurForSwitcher: function () {
       var ta = term.textarea;
       if (ta && document.activeElement === ta) ta.blur();
+    },
+
+
+    /**
+     * Find in the whole buffer, scrollback included. `mode` is "incr" while
+     * the query is being typed (keeps the current hit when it still matches),
+     * "next" / "prev" for the arrows. Returns "bad" for an invalid regex,
+     * "ok" otherwise; the hit count comes back through
+     * NexusAndroid.onSearchResult.
+     */
+    find: function (q, caseSensitive, wholeWord, regex, mode) {
+      if (!searchAddon) {
+        reportSearch(-1, -1); // -1 count = unavailable, not "no matches".
+        return "unavailable";
+      }
+      if (!q) {
+        searchAddon.clearDecorations();
+        if (window.NexusAndroid && window.NexusAndroid.onSearchResult) window.NexusAndroid.onSearchResult(-1, 0);
+        return "ok";
+      }
+      if (regex) {
+        try { new RegExp(q); } catch (e) { return "bad"; }
+      }
+      var opts = {
+        caseSensitive: !!caseSensitive,
+        wholeWord: !!wholeWord,
+        regex: !!regex,
+        incremental: mode === "incr",
+        decorations: FIND_DECO,
+      };
+      var found = mode === "prev" ? searchAddon.findPrevious(q, opts) : searchAddon.findNext(q, opts);
+      if (!found && window.NexusAndroid && window.NexusAndroid.onSearchResult) {
+        window.NexusAndroid.onSearchResult(-1, 0);
+      }
+      return "ok";
+    },
+
+    /** Closing the find bar: drop the highlights and the current-hit selection. */
+    clearFind: function () {
+      if (searchAddon) searchAddon.clearDecorations();
+      term.clearSelection();
+    },
+
+    /** rulesJson: [{color:"#RRGGBB", text:"..."}]; returns the number of hits. */
+    applyMarks: function (rulesJson, caseSensitive) {
+      return marks.apply(JSON.parse(rulesJson), !!caseSensitive);
+    },
+
+    clearMarks: function () {
+      marks.clear();
+    },
+
+    /** The rules in force, for the mark dialog: {rules:[{color,text}], caseSensitive}. */
+    marksState: function () {
+      return JSON.stringify({ rules: marks.rules, caseSensitive: marks.caseSensitive });
     },
 
     /**

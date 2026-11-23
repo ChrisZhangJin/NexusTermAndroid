@@ -13,7 +13,12 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CoroutineScope
@@ -93,6 +98,76 @@ class TerminalHandle internal constructor(
      */
     var virtualWindow: Boolean = true
         private set
+
+    /** 一条标记规则：[color] 是 #RRGGBB，[text] 是要高亮的文字。 */
+    data class MarkRule(val color: String, val text: String)
+
+    /**
+     * 查找结果：当前命中的序号（从 0 起，-1 = 没有当前命中）和命中总数。
+     * 页面画高亮是延时的，所以结果由页面推过来（NexusAndroid.onSearchResult），不是调用的返回值。
+     */
+    var searchIndex by mutableIntStateOf(-1)
+        private set
+    var searchCount by mutableIntStateOf(0)
+        private set
+
+    /** 生效的标记规则条数，终端菜单里「标记…」旁边的提示用。 */
+    var markCount by mutableIntStateOf(0)
+        private set
+
+    internal fun onSearchResult(index: Int, count: Int) {
+        webView.post {
+            searchIndex = index
+            searchCount = count
+        }
+    }
+
+    /**
+     * 在整个缓冲区（含滚动历史）里查找。[mode]："incr" = 边输入边找，"next" / "prev" = 上一个 / 下一个。
+     * [onValid] 收到 false = 正则写错了（页面没去查）。
+     */
+    fun find(query: String, caseSensitive: Boolean, wholeWord: Boolean, regex: Boolean, mode: String, onValid: (Boolean) -> Unit = {}) {
+        val q = JSONObject.quote(query)
+        webView.evaluateJavascript(
+            "window.NexusTerm ? window.NexusTerm.find($q, $caseSensitive, $wholeWord, $regex, '$mode') : 'ok'",
+        ) { raw -> onValid(raw?.trim('"') != "bad") }
+    }
+
+    /** 关查找条：撤掉高亮和当前命中的选中。 */
+    fun clearFind() {
+        searchIndex = -1
+        searchCount = 0
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.clearFind();", null)
+    }
+
+    /** 读出现在生效的标记规则和大小写开关；页面没起来就按「没有规则」回调。 */
+    fun readMarks(onResult: (rules: List<MarkRule>, caseSensitive: Boolean) -> Unit) {
+        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.marksState() : ''") { raw ->
+            val o = runCatching { JSONObject(JSONArray("[$raw]").optString(0, "")) }.getOrNull()
+            val arr = o?.optJSONArray("rules")
+            val rules = (0 until (arr?.length() ?: 0)).mapNotNull { i ->
+                arr?.optJSONObject(i)?.let { MarkRule(it.optString("color"), it.optString("text")) }
+            }
+            onResult(rules, o?.optBoolean("caseSensitive", false) ?: false)
+        }
+    }
+
+    /** 设置标记规则并立刻重扫整个缓冲区；[onHits] 收到命中总数。新输出之后页面会自己重扫。 */
+    fun applyMarks(rules: List<MarkRule>, caseSensitive: Boolean, onHits: (Int) -> Unit = {}) {
+        val active = rules.filter { it.text.isNotEmpty() }
+        markCount = active.size
+        val json = JSONArray().also { arr ->
+            active.forEach { arr.put(JSONObject().put("color", it.color).put("text", it.text)) }
+        }.toString()
+        webView.evaluateJavascript(
+            "window.NexusTerm ? window.NexusTerm.applyMarks(${JSONObject.quote(json)}, $caseSensitive) : 0",
+        ) { raw -> onHits(raw?.toIntOrNull() ?: 0) }
+    }
+
+    fun clearMarks() {
+        markCount = 0
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.clearMarks();", null)
+    }
 
     // `window.NexusTerm` only exists once index.html's inline <script> has
     // actually run — which is strictly after onPageFinished, not right
@@ -434,6 +509,9 @@ fun createTerminal(
     historyKey: String = "",
 ): TerminalHandle {
     val startFontSize = TerminalPrefs.fontSize(context)
+    // 页面推来的查找结果要交给 handle，而 handle 要等 WebView 建好才有：先放个转接。
+    var searchSink: (Int, Int) -> Unit = { _, _ -> }
+    // 同上：输入行 / 新命令要交给 handle。handle 建好之前页面还没加载，不会有回调。
     val webView = WebView(context).apply {
         // Without explicit layoutParams, a WebView attached by an
         // AndroidView can end up measured at a near-zero height — Blink's
@@ -475,6 +553,12 @@ fun createTerminal(
                     CommandHistory.record(context, historyKey, cmd)
                 }
 
+                // 查找命中数：画高亮是延时的，页面算完才推过来（NexusTerm.find）。
+                @JavascriptInterface
+                fun onSearchResult(index: Int, count: Int) {
+                    searchSink(index, count)
+                }
+
                 // Read synchronously by index.html before its first fit.
                 @JavascriptInterface
                 fun initialFontSize(): Int = startFontSize
@@ -484,6 +568,7 @@ fun createTerminal(
     }
 
     val handle = TerminalHandle(webView, startFontSize, historyKey)
+    searchSink = handle::onSearchResult
     webView.webViewClient = object : WebViewClient() {
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
