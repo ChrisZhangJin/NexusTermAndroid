@@ -69,8 +69,10 @@ import com.nexusterm.android.ui.joinCwd
 import com.nexusterm.android.ui.maxBytes
 import com.nexusterm.android.ui.viewFileName
 import com.nexusterm.android.ui.viewableKind
+import com.nexusterm.android.ui.AuthPromptHost
 import com.nexusterm.android.ui.HostKeyAlertHost
 import com.nexusterm.android.ui.HostKeyAlerts
+import com.nexusterm.android.ui.AuthPrompts
 import com.nexusterm.android.ui.SessionFormInitial
 import com.nexusterm.android.ui.SessionListScreen
 import com.nexusterm.android.ui.SftpScreen
@@ -555,6 +557,7 @@ class MainActivity : ComponentActivity() {
                             auth = auth,
                             listener = listener,
                             sidecar = !SidecarPrefs.isDenied(this@MainActivity, session.id),
+                            totpSeed = SecretsStore.getTotpSeed(this@MainActivity, session.id),
                         )
                         Log.d(TAG, "connected, sessionId=${handle.sessionId}")
                         live.liveSessionId = handle.sessionId
@@ -875,6 +878,8 @@ class MainActivity : ComponentActivity() {
                             SftpScreen(sessionId = sessionId, onBack = { navController.popBackStack() })
                         }
                     }
+                    // 二次验证 / 私钥口令的输入框：盖在所有页面之上，哪个页面发起的连接都用它。
+                    AuthPromptHost()
                     // 主机指纹变化的确认框，同上。
                     HostKeyAlertHost()
                 }
@@ -963,6 +968,7 @@ class MainActivity : ComponentActivity() {
                         auth = authMethodFor(saved),
                         listener = live.listener!!,
                         sidecar = !SidecarPrefs.isDenied(this@MainActivity, saved.id),
+                        totpSeed = SecretsStore.getTotpSeed(this@MainActivity, saved.id),
                     )
                 }
             }
@@ -1465,15 +1471,11 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Placeholder UI for keyboard-interactive / private-key-passphrase
-     * prompts, carried over unchanged from the vertical slice: a real dialog
-     * built from `prompt.fields` is still future work, so this auto-cancels
-     * (empty string) and lets a 2FA server fail fast with a clear message
-     * instead of hanging for 180s (see [SessionListenerImpl]'s own timeout).
+     * 二次验证 / 私钥口令：交给 [AuthPrompts] 排队，由 [AuthPromptHost] 弹框问用户。
+     * 配了 TOTP 种子的连接，验证码题在 Rust 侧就自动算好提交了，根本不会走到这里
+     * （除非自动提交的码被拒，那时会带着预填的码再问一次）。
      */
-    private suspend fun promptUserForAnswer(prompt: AuthPrompt): String {
-        return ""
-    }
+    private suspend fun promptUserForAnswer(prompt: AuthPrompt): String = AuthPrompts.ask(prompt)
 
     /**
      * Hosts [ConnectScreen] for both "new session" (`sessionId == null`) and
@@ -1509,6 +1511,7 @@ class MainActivity : ComponentActivity() {
                             keyPath = record.keyPath ?: "",
                             password = SecretsStore.getPassword(this@MainActivity, record.id) ?: "",
                             passphrase = SecretsStore.getPassphrase(this@MainActivity, record.id) ?: "",
+                            totpSeed = SecretsStore.getTotpSeed(this@MainActivity, record.id) ?: "",
                         )
                     }
                 } catch (e: StoreException) {
@@ -1558,8 +1561,9 @@ class MainActivity : ComponentActivity() {
                         when (result.authKind) {
                             AuthKind.PASSWORD -> SecretsStore.savePassword(this@MainActivity, saved.id, result.password)
                             AuthKind.PRIVATE_KEY -> SecretsStore.savePassphrase(this@MainActivity, saved.id, result.passphrase)
-                            AuthKind.AGENT -> SecretsStore.clear(this@MainActivity, saved.id)
+                            AuthKind.AGENT -> SecretsStore.clearLogin(this@MainActivity, saved.id)
                         }
+                        SecretsStore.saveTotpSeed(this@MainActivity, saved.id, result.totpSeed)
                         onDone()
                     } catch (e: StoreException) {
                         errorMessage = e.message ?: "保存失败"

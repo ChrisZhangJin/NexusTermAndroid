@@ -57,8 +57,10 @@ object SshClient {
         auth: AuthMethod,
         listener: TerminalEventListener,
         sidecar: Boolean = true,
+        /** 这条配置的 TOTP 种子（[SecretsStore.getTotpSeed]）；有就在二次验证时自动算码提交。 */
+        totpSeed: String? = null,
     ): SessionHandle = withContext(Dispatchers.IO) {
-        uniffiConnect(configId, host, port.toUShort(), username, auth, listener, sidecar)
+        uniffiConnect(configId, host, port.toUShort(), username, auth, listener, sidecar, totpSeed)
     }
 
     /**

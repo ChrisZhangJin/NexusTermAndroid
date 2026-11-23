@@ -190,7 +190,8 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                 onDataCallback = { _, _ -> },
                 onPulseCallback = { _ -> },
                 onClosedCallback = { _, _ -> },
-                onAuthPromptCallback = { "" },
+                // 复用不到终端连接、要独立拨号时，二次验证和终端一样弹框 / 自动填码。
+                onAuthPromptCallback = { AuthPrompts.ask(it) },
             )
             val handle = SftpClient.connect(
                 configId = sessionId,
@@ -199,6 +200,7 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
                 username = record.username,
                 auth = auth,
                 listener = listener,
+                totpSeed = SecretsStore.getTotpSeed(context, sessionId),
             )
             handleId = handle.handleId
             android.util.Log.d(

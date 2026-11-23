@@ -56,8 +56,9 @@ object SftpClient {
         username: String,
         auth: AuthMethod,
         listener: TerminalEventListener,
+        totpSeed: String? = null,
     ): SftpHandle = withContext(Dispatchers.IO) {
-        uniffiSftpConnect(configId, host, port.toUShort(), username, auth, listener)
+        uniffiSftpConnect(configId, host, port.toUShort(), username, auth, listener, totpSeed)
     }
 
     suspend fun list(handleId: String, path: String): List<RemoteEntry> = withContext(Dispatchers.IO) {

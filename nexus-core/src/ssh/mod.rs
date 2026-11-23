@@ -577,6 +577,7 @@ pub async fn open_authenticated(
         auth,
         session_id,
         on_keepalive,
+        ctx.totp.as_deref(),
         move |p| {
             let prompts = prompts.clone();
             let listener = listener.clone();
@@ -653,6 +654,7 @@ async fn open_authenticated_with<F, Fut>(
     auth: &AuthMethod,
     session_id: &str,
     on_keepalive: Option<Arc<dyn Fn() + Send + Sync>>,
+    totp: Option<&crate::totp::TotpAutofill>,
     ask: F,
 ) -> Result<Opened, OpenError>
 where
@@ -696,7 +698,7 @@ where
     // 第一因子的状态。断开重连会把这份状态丢掉，服务端于是又要求先输密码。
     //
     // （russh 0.49 原本在这里会静默丢包并永久挂起，已由 `vendor/russh` 修掉。）
-    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask).await {
+    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask, totp).await {
         Ok(session::KbiOutcome::Done) => {
             return Ok(Opened { session, legacy });
         }
@@ -738,7 +740,7 @@ where
     let legacy = hs.legacy;
     let mut session = hs.session;
 
-    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask).await {
+    match session::authenticate_kbi(&mut session, username, &auth, session_id, host, &ask, totp).await {
         Ok(session::KbiOutcome::Done) => Ok(Opened { session, legacy }),
         // 换了新连接还是一个问题都不问 → 服务端确实不要这一步，
         // 那就回到「主认证方式失败」的原始文案。
@@ -1224,6 +1226,7 @@ mod crypto_tests {
             },
             "probe",
             None,
+            None, // totp
             move |p: prompt::AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 let otp = otp.clone();
@@ -1294,6 +1297,7 @@ mod kbi_flow {
             },
             "probe",
             None,
+            None, // totp
             move |p: prompt::AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 async move {
@@ -1348,6 +1352,7 @@ mod kbi_flow {
             },
             "probe",
             None,
+            None, // totp
             |_p: prompt::AuthPrompt| async move { Err(prompt::AskAbort::Cancelled) },
         )
         .await

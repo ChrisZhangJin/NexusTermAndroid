@@ -1138,6 +1138,7 @@ dependencies = [
  "base64",
  "cbc",
  "chrono",
+ "data-encoding",
  "hmac",
  "parking_lot",
  "rand_core",

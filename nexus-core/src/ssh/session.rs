@@ -82,7 +82,10 @@ pub struct ConnectRequest {
     /// `CHANNEL_OPEN` 会直接断开客户端 —— 表现为「连上几秒就掉线」。
     /// 这类会话把这里设为 `false`，状态栏与上下文恢复相应退化（不影响终端本身）。
     #[serde(default)]
-    pub sidecar: Option<bool>,
+    pub sidecar: Option<bool>,    /// 这条连接配置的 TOTP 种子（base32 或 otpauth:// 链接）。有就在二次验证时
+    /// 本地算码自动填，见 [`crate::totp`]。Android 侧存在加密偏好里，每次拨号带进来。
+    #[serde(default)]
+    pub totp_seed: Option<String>,
 }
 
 /// 连接成功后的协商结果，回给前端以便提示「本次用了旧算法」。
@@ -374,6 +377,7 @@ impl SessionManager {
             AuthContext {
                 listener: listener.clone(),
                 prompts: self.auth_prompts.clone(),
+                totp: crate::totp::autofill_from(req.totp_seed.as_deref()).map(Arc::new),
             },
         )
         .await
@@ -702,6 +706,11 @@ impl SessionManager {
 pub struct AuthContext {
     pub listener: Arc<dyn crate::listener::TerminalEventListener>,
     pub prompts: Arc<AuthPrompts>,
+    /// 这条连接配置的 TOTP 种子装成的填码器，用来自动填二次验证的码。没配就是 `None`。
+    ///
+    /// 整次连接共用一个实例：「已经用掉哪个时间步」和「还要不要自动提交」必须跨越
+    /// `open_authenticated` 里那两次 KBI 尝试。
+    pub totp: Option<Arc<crate::totp::TotpAutofill>>,
 }
 
 /// 第一次认证的结果。
@@ -754,12 +763,49 @@ fn reusable_password(auth: &AuthMethod) -> Option<&str> {
 ///
 /// 只认 `echo == false` 的秘密输入：明文回显的提示（比如 "Enter new password"）
 /// 自动填进去没有意义，交给用户自己写。
+///
+/// **必须在 [`asks_for_otp`] 之后判断**，见那边的说明。
 fn asks_for_password(text: &str, echo: bool) -> bool {
     if echo {
         return false;
     }
     let t = text.to_ascii_lowercase();
     t.contains("password") || t.contains("passwd") || t.contains("密码")
+}
+
+/// 这条提示是不是在要动态口令（TOTP / 验证码）。
+///
+/// 两点和 [`asks_for_password`] 不一样，都踩过：
+///
+/// 1. **不看 `echo`。** 验证码经常是明文回显的（堡垒机上输完那六位就明晃晃
+///    打在屏幕上），拿 `echo == false` 当门槛会把它们全漏掉。
+/// 2. **要先于密码判断。** PAM 模块里 "One-time password:" / "OTP password:"
+///    这种写法很常见，`echo == false` 且含 "password"，先问密码的话会把账号
+///    密码填进验证码框 —— 既登不上，还把真密码送进了一个会被记日志的字段。
+///
+/// Android 弹框的 `isOneTimeCode()`（ui/AuthPromptDialog.kt）用同一份关键词表，改要一起改。
+fn asks_for_otp(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "otp",
+        "mfa",
+        "2fa",
+        "one-time",
+        "onetime",
+        "one time",
+        "verif",
+        "passcode",
+        "authenticator",
+        "google auth",
+        "totp",
+        "dynamic code",
+    ]
+    .iter()
+    .any(|k| t.contains(k))
+        || text.contains("验证码")
+        || text.contains("动态口令")
+        || text.contains("动态码")
+        || text.contains("一次性")
 }
 
 /// RSA 公钥认证要按服务端能力挑签名算法。
@@ -907,11 +953,21 @@ where
     F: Fn(AuthPrompt) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<String>, AskAbort>>,
 {
-    authenticate_kbi(handle, username, auth, session_id, host, &ask).await
+    authenticate_kbi(handle, username, auth, session_id, host, &ask, None).await
 }
 
-/// [`authenticate_kbi_with`] 的实现体，闭包按引用传 —— 调用方常常要在
-/// 「同一连接重试」和「换连接重试」两条路径上复用同一个闭包。
+/// 只走 keyboard-interactive。两种调用姿势都对：
+///
+/// * **纯 KBI 服务器**（KBI 就是第一因子）：新连接上直接调；
+/// * **密码 / 公钥 + 动态口令**：先做完第一因子，**在同一条连接上**接着调
+///   （russh 0.49 在这里会静默丢包挂起，已由 `vendor/russh` 修掉）。
+///
+/// 闭包按引用传：调用方要在「同一连接重试」和「换连接重试」两条路径上复用它。
+/// 「问用户」做成参数而非写死 `AuthPrompts`，是为了能对着真服务端跑测试。
+///
+/// `totp` 是这条连接配置里存的种子（没配就是 `None`）。它按引用传且跨两次调用
+/// 共用同一个实例 —— 「已经发过哪个时间步的码」「还允不允许自动提交」都是
+/// **整次连接**的状态，不是单次 KBI 的。
 pub(crate) async fn authenticate_kbi<H, F, Fut>(
     handle: &mut Handle<H>,
     username: &str,
@@ -919,6 +975,7 @@ pub(crate) async fn authenticate_kbi<H, F, Fut>(
     session_id: &str,
     host: &str,
     ask: &F,
+    totp: Option<&crate::totp::TotpAutofill>,
 ) -> Result<KbiOutcome, SessionError>
 where
     H: russh::client::Handler,
@@ -939,7 +996,18 @@ where
     let mut round = 0u32;
     // 是否出现过「非密码」的问题(验证码 / 挑战码)。有这个才说明真的做了二次验证，
     // 否则只是把密码重问了一遍，失败时就该说「密码不正确」。
+    //
+    // 判据是「这道题是不是密码题」，**不是**「有没有预填」。曾经写成后者，
+    // 因为那时只有密码会被预填，两者恰好等价；给验证码也加上预填之后
+    // 这个巧合就不成立了，失败文案会从「验证码错误或已过期」退化成「密码不正确」。
     let mut saw_challenge = false;
+    // 上一轮是不是我们自己算码自动提交的。服务端如果**又问了一遍**，
+    // 就说明那次没过 —— 这是我们能拿到的唯一失败信号（KBI 的重试表现为
+    // 再来一个 INFO_REQUEST，而不是 FAILURE）。
+    let mut auto_submitted = false;
+    // 「纯提示」轮（没有输入框）里服务器说的话。堡垒机常把 MFA 菜单放在这样一轮里，
+    // 下一轮才是 `Option>`；这些文字要带到下一个真正的弹框里，不能随空应答一起丢。
+    let mut carried_info = String::new();
 
     loop {
         match resp {
@@ -950,6 +1018,12 @@ where
                 return Ok(KbiOutcome::Unavailable);
             }
             Resp::Failure if saw_challenge => {
+                if auto_submitted {
+                    // 换连接那条兜底路径还会再走一遍 KBI，别再自动提交了。
+                    if let Some(t) = totp {
+                        t.disable_auto();
+                    }
+                }
                 return Err(SessionError::Auth(
                     "二次验证未通过：验证码错误或已过期".into(),
                 ));
@@ -970,56 +1044,134 @@ where
                     ));
                 }
 
+                // 服务端又问了一遍，而上一轮是我们自己填的 —— 那一轮没过。
+                // 立刻降级为「只预填」：连错几次会锁账号，而真出问题时
+                // （种子抄错、两端时间不同步）自动重试只会把次数烧得更快。
+                if auto_submitted {
+                    tracing::warn!(round, "自动提交的验证码未通过，本次连接改为只预填");
+                    if let Some(t) = totp {
+                        t.disable_auto();
+                    }
+                }
+                auto_submitted = false;
+
+                // 服务器到底发了什么，现场排查二次验证问题时第一手要看的东西。
+                // 只记题面，不记任何用户填的内容。
+                tracing::info!(
+                    round,
+                    name = %name,
+                    instructions = %instructions,
+                    prompts = ?prompts.iter().map(|p| (p.prompt.as_str(), p.echo)).collect::<Vec<_>>(),
+                    "keyboard-interactive：收到服务器的问题"
+                );
+
                 let mut answers = if prompts.is_empty() {
-                    // 纯提示（没有可填字段），回空列表表示「知道了」
+                    // 纯提示（没有可填字段），回空列表表示「知道了」。
+                    // 但文字要留着，见 `carried_info`。
+                    for part in [name.trim(), instructions.trim()] {
+                        if !part.is_empty() && !carried_info.contains(part) {
+                            if !carried_info.is_empty() {
+                                carried_info.push('\n');
+                            }
+                            carried_info.push_str(part);
+                        }
+                    }
                     Vec::new()
                 } else {
-                    let fields: Vec<AuthPromptField> = prompts
-                        .iter()
-                        .map(|p| {
-                            let prefill = match password_hint {
-                                Some(pw) if asks_for_password(&p.prompt, p.echo) => {
-                                    Some(pw.to_string())
+                    // 每个字段尽量自己填上。只有**全部**字段都填上了、
+                    // 且其中确实有验证码题，才谈得上自动提交。
+                    let mut fields: Vec<AuthPromptField> = Vec::with_capacity(prompts.len());
+                    let mut filled: Option<Vec<String>> = Some(Vec::with_capacity(prompts.len()));
+                    let mut any_otp = false;
+
+                    for p in &prompts {
+                        let is_otp = asks_for_otp(&p.prompt);
+                        // 顺序要紧：见 `asks_for_otp` 的说明。
+                        let is_password = !is_otp && asks_for_password(&p.prompt, p.echo);
+                        if !is_password {
+                            saw_challenge = true;
+                        }
+
+                        let prefill = if is_password {
+                            password_hint.map(|pw| pw.to_string())
+                        } else if is_otp {
+                            match totp {
+                                Some(t) => {
+                                    any_otp = true;
+                                    // 可能会为了跨过快到期的窗口等几秒。
+                                    Some(t.next_code().await)
                                 }
-                                _ => None,
-                            };
-                            if prefill.is_none() {
-                                saw_challenge = true;
+                                None => None,
                             }
-                            AuthPromptField {
-                                prompt: p.prompt.clone(),
-                                echo: p.echo,
-                                prefill,
+                        } else {
+                            None
+                        };
+
+                        match (&mut filled, &prefill) {
+                            (Some(v), Some(value)) => v.push(value.clone()),
+                            // 有一个字段填不上，这一轮就只能交给用户
+                            _ => filled = None,
+                        }
+                        fields.push(AuthPromptField {
+                            prompt: p.prompt.clone(),
+                            echo: p.echo,
+                            prefill,
+                        });
+                    }
+
+                    let auto = filled
+                        .filter(|_| any_otp)
+                        .filter(|_| totp.is_some_and(|t| t.auto_submit()));
+                    if let Some(answers) = auto {
+                        tracing::info!(round, "二次验证：本地算码并自动提交");
+                        auto_submitted = true;
+                        // 跳过弹框，直接应答 —— 用户连那一下回车都省了
+                        answers
+                    } else {
+                        // 先前纯提示轮攒下的文字拼在最前面，用掉就清空
+                        let instructions = if carried_info.is_empty() {
+                            instructions
+                        } else {
+                            let head = std::mem::take(&mut carried_info);
+                            if instructions.trim().is_empty() {
+                                // 弹框只显示 instructions，空的话才退回 name；
+                                // 这里 instructions 已被占用，name 要一并带上
+                                if name.trim().is_empty() {
+                                    head
+                                } else {
+                                    format!("{head}\n\n{}", name.trim())
+                                }
+                            } else {
+                                format!("{head}\n\n{instructions}")
                             }
-                        })
-                        .collect();
+                        };
+                        let prompt = AuthPrompt {
+                            session_id: session_id.to_string(),
+                            kind: "keyboard-interactive".into(),
+                            host: host.to_string(),
+                            username: username.to_string(),
+                            name,
+                            instructions,
+                            fields,
+                            round,
+                        };
 
-                    let prompt = AuthPrompt {
-                        session_id: session_id.to_string(),
-                        kind: "keyboard-interactive".into(),
-                        host: host.to_string(),
-                        username: username.to_string(),
-                        name,
-                        instructions,
-                        fields,
-                        round,
-                    };
-
-                    match ask(prompt).await {
-                        Ok(a) => a,
-                        Err(AskAbort::Timeout) => {
-                            return Err(SessionError::Auth(
-                                "等待验证码输入超时，连接已中止".into(),
-                            ))
-                        }
-                        Err(AskAbort::Unavailable) => {
-                            return Err(SessionError::Auth(
-                                "无法显示验证码输入框，连接已中止".into(),
-                            ))
-                        }
-                        // 用户点了取消 / 会话被关
-                        Err(AskAbort::Cancelled) => {
-                            return Err(SessionError::Auth("已取消二次验证，连接中止".into()))
+                        match ask(prompt).await {
+                            Ok(a) => a,
+                            Err(AskAbort::Timeout) => {
+                                return Err(SessionError::Auth(
+                                    "等待验证码输入超时，连接已中止".into(),
+                                ))
+                            }
+                            Err(AskAbort::Unavailable) => {
+                                return Err(SessionError::Auth(
+                                    "无法显示验证码输入框，连接已中止".into(),
+                                ))
+                            }
+                            // 用户点了取消 / 会话被关
+                            Err(AskAbort::Cancelled) => {
+                                return Err(SessionError::Auth("已取消二次验证，连接中止".into()))
+                            }
                         }
                     }
                 };
@@ -1319,7 +1471,7 @@ async fn graceful_close(handle: &Handle<ClientHandler>) {
 
 #[cfg(test)]
 mod auth_prompt_tests {
-    use super::asks_for_password;
+    use super::{asks_for_otp, asks_for_password};
 
     #[test]
     fn detects_password_prompts() {
@@ -1336,6 +1488,50 @@ mod auth_prompt_tests {
         assert!(!asks_for_password("OTP Code:", false));
         assert!(!asks_for_password("Password: ", true));
         assert!(!asks_for_password("", false));
+    }
+
+    #[test]
+    fn detects_otp_prompts_regardless_of_echo() {
+        // 验证码常常是明文回显的，`echo` 不能当判据
+        for p in [
+            "Verification code:",
+            "OTP Code:",
+            "[OTP Code]: ",
+            "Enter MFA token:",
+            "2FA code: ",
+            "One-time password: ",
+            "Google Authenticator code:",
+            "TOTP: ",
+            "请输入验证码：",
+            "动态口令：",
+        ] {
+            assert!(asks_for_otp(p), "应判为验证码：{p:?}");
+        }
+    }
+
+    #[test]
+    fn plain_password_prompts_are_not_otp() {
+        for p in [
+            "Password:",
+            "user@host's password: ",
+            "Enter PASSWD: ",
+            "密码：",
+            "",
+        ] {
+            assert!(!asks_for_otp(p), "不该判为验证码：{p:?}");
+        }
+    }
+
+    /// 关键的优先级：PAM 里 "One-time password:" 这种写法既含 "password"
+    /// 又 `echo == false`，两个判定都命中。先问验证码才对 —— 反过来会把账号
+    /// 密码填进验证码框。
+    #[test]
+    fn otp_wins_over_password_on_overlapping_prompts() {
+        for p in ["One-time password:", "OTP password: ", "一次性密码："] {
+            assert!(asks_for_otp(p), "{p:?}");
+            // asks_for_password 单看也会命中，所以调用处必须先问 asks_for_otp
+            assert!(asks_for_password(p, false), "{p:?}");
+        }
     }
 }
 
@@ -1715,6 +1911,7 @@ mod kbi_probe {
             },
             "probe-key",
             None,
+            None, // totp
             // 明文私钥不该问任何问题；问了就说明判定逻辑错了
             |_p: AuthPrompt| async move { Err(AskAbort::Cancelled) },
         )
@@ -1753,6 +1950,7 @@ mod kbi_probe {
             },
             "probe-encrypted",
             None,
+            None, // totp
             move |p: AuthPrompt| {
                 sink.lock().unwrap().push(p.clone());
                 let answer = secret.clone();
@@ -1798,6 +1996,7 @@ mod kbi_probe {
             },
             "probe-wrong",
             None,
+            None, // totp
             move |p: AuthPrompt| {
                 let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 sink.lock().unwrap().push(p.instructions.clone());

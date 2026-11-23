@@ -25,6 +25,7 @@ object SecretsStore {
     private const val PREFS_FILE = "nexus_term_secrets"
     private const val PASSWORD_PREFIX = "password:"
     private const val PASSPHRASE_PREFIX = "passphrase:"
+    private const val TOTP_PREFIX = "totp:"
 
     @Volatile
     private var cached: SharedPreferences? = null
@@ -62,11 +63,33 @@ object SecretsStore {
     fun getPassphrase(context: Context, sessionId: String): String? =
         prefs(context).getString(PASSPHRASE_PREFIX + sessionId, null)
 
+    /**
+     * 二次验证用的 TOTP 种子（base32 或 otpauth:// 链接）。和登录凭据分开存、分开清：
+     * 改认证方式（比如密码 → 无凭据）不该把种子也丢掉。空串 = 删除。
+     */
+    fun saveTotpSeed(context: Context, sessionId: String, seed: String) {
+        val e = prefs(context).edit()
+        if (seed.isBlank()) e.remove(TOTP_PREFIX + sessionId) else e.putString(TOTP_PREFIX + sessionId, seed.trim())
+        e.apply()
+    }
+
+    fun getTotpSeed(context: Context, sessionId: String): String? =
+        prefs(context).getString(TOTP_PREFIX + sessionId, null)
+
+    /** 只清登录凭据（密码 / 私钥口令），留着 TOTP 种子：改成「无凭据」认证时用。 */
+    fun clearLogin(context: Context, sessionId: String) {
+        prefs(context).edit()
+            .remove(PASSWORD_PREFIX + sessionId)
+            .remove(PASSPHRASE_PREFIX + sessionId)
+            .apply()
+    }
+
     /** Called when a saved session is deleted, so its secrets don't outlive it. */
     fun clear(context: Context, sessionId: String) {
         prefs(context).edit()
             .remove(PASSWORD_PREFIX + sessionId)
             .remove(PASSPHRASE_PREFIX + sessionId)
+            .remove(TOTP_PREFIX + sessionId)
             .apply()
     }
 }

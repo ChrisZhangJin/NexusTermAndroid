@@ -20,15 +20,20 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
+import uniffi.nexus_core.SessionException
+import uniffi.nexus_core.totpCheck
 
 /** The three auth methods nexus-core's `AuthMethod` enum supports (see nexus-core/src/ssh/session.rs). */
 enum class AuthKind { PASSWORD, PRIVATE_KEY, AGENT }
@@ -48,6 +53,8 @@ data class SessionFormResult(
     val keyPath: String,
     val password: String,
     val passphrase: String,
+    /** TOTP 种子，空串 = 不用（删掉已存的）。 */
+    val totpSeed: String,
 )
 
 /** Pre-fills the form when editing an existing session; `null` means "new session". */
@@ -60,7 +67,23 @@ data class SessionFormInitial(
     val keyPath: String = "",
     val password: String = "",
     val passphrase: String = "",
+    val totpSeed: String = "",
 )
+
+/**
+ * 校验 TOTP 种子：合法返回 (此刻的验证码, null)，不合法返回 (null, 中文原因)。空串返回两个 null。
+ * 算码走 nexus-core（和真正登录时自动填码是同一份实现），给用户拿去和验证器 App 对一下。
+ */
+internal fun checkTotpSeed(seed: String): Pair<String?, String?> {
+    if (seed.isBlank()) return null to null
+    return try {
+        totpCheck(seed) to null
+    } catch (e: SessionException.Auth) {
+        null to e.v1
+    } catch (e: Exception) {
+        null to (e.message ?: "种子无法解析")
+    }
+}
 
 /**
  * Add/edit session form. Was the vertical slice's only screen (immediate
@@ -90,6 +113,19 @@ fun ConnectScreen(
     var keyPath by remember { mutableStateOf(initial.keyPath) }
     var password by remember { mutableStateOf(initial.password) }
     var passphrase by remember { mutableStateOf(initial.passphrase) }
+    var totpSeed by remember { mutableStateOf(initial.totpSeed) }
+    // 种子填对时每秒刷新一次当前验证码；填错时显示原因。
+    var totpCode by remember { mutableStateOf<String?>(null) }
+    var totpError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(totpSeed) {
+        while (true) {
+            val (code, err) = checkTotpSeed(totpSeed)
+            totpCode = code
+            totpError = err
+            if (code == null) break
+            delay(1000)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -202,6 +238,31 @@ fun ConnectScreen(
                 }
             }
 
+            // 二次验证：和认证方式无关（密码 / 私钥 / 无凭据之后都可能再问验证码），所以单列一段。
+            androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 16.dp))
+            Text(text = "二次验证（可选）", style = MaterialTheme.typography.labelLarge)
+            OutlinedTextField(
+                value = totpSeed,
+                onValueChange = { totpSeed = it },
+                label = { Text("TOTP 种子") },
+                placeholder = { Text("base32 密钥或 otpauth:// 链接") },
+                singleLine = true,
+                isError = totpError != null,
+                visualTransformation = PasswordVisualTransformation(),
+                supportingText = {
+                    Text(
+                        when {
+                            totpError != null -> totpError!!
+                            totpCode != null -> "当前验证码 $totpCode —— 和验证器 App 上的一致就说明填对了"
+                            else -> "填了之后，服务器要验证码时自动算好提交，不再弹框"
+                        },
+                        fontFamily = if (totpCode != null && totpError == null) FontFamily.Monospace else null,
+                    )
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+            )
+
             androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 16.dp))
 
             if (errorMessage != null) {
@@ -210,7 +271,7 @@ fun ConnectScreen(
             }
 
             Button(
-                enabled = !isSaving && name.isNotBlank() && host.isNotBlank() && username.isNotBlank(),
+                enabled = !isSaving && name.isNotBlank() && host.isNotBlank() && username.isNotBlank() && totpError == null,
                 onClick = {
                     val portNumber = port.toIntOrNull() ?: 22
                     onSave(
@@ -223,6 +284,7 @@ fun ConnectScreen(
                             keyPath = keyPath.trim(),
                             password = password,
                             passphrase = passphrase,
+                            totpSeed = totpSeed.trim(),
                         )
                     )
                 },

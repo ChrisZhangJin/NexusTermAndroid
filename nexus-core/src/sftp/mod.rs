@@ -178,7 +178,8 @@ fn map_open_err(host: &str, port: u16, timeout: Duration, e: OpenError) -> SftpE
 /// 对上号。
 ///
 /// `listener` 仅用于二次验证/私钥口令问询——SFTP 操作本身没有"终端输出"这个
-/// 概念，`on_data`/`on_pulse` 不会被这条路径触发。
+/// 概念，`on_data`/`on_pulse` 不会被这条路径触发。`totp_seed` 同 `connect()`：
+/// 独立拨号要二次验证时本地算码自动填。
 #[uniffi::export]
 pub fn sftp_connect(
     config_id: String,
@@ -187,6 +188,7 @@ pub fn sftp_connect(
     username: String,
     auth: AuthMethod,
     listener: Box<dyn TerminalEventListener>,
+    totp_seed: Option<String>,
 ) -> Result<SftpHandle, SftpError> {
     let listener: Arc<dyn TerminalEventListener> = Arc::from(listener);
     let id = new_handle_id();
@@ -251,6 +253,7 @@ pub fn sftp_connect(
             AuthContext {
                 listener: listener.clone(),
                 prompts,
+                totp: crate::totp::autofill_from(totp_seed.as_deref()).map(Arc::new),
             },
         ))
         .map_err(|e| map_open_err(&host, port, timeout, e))?;
@@ -732,6 +735,7 @@ mod tests {
             user,
             AuthMethod::Password { password },
             Box::new(NullListener),
+            None,
         )
         .expect("连接失败");
 

@@ -14,6 +14,7 @@ pub mod logging;
 pub mod sftp;
 pub mod ssh;
 pub mod store;
+pub mod totp;
 
 use std::sync::{Arc, OnceLock};
 
@@ -197,6 +198,9 @@ pub fn delete_session(id: String) -> Result<(), StoreError> {
 /// 错误文案包含 `ssh::session::SIDECAR_DENIED`，调用方据此为该配置改传
 /// `false`。为 `false` 时一条额外通道都不开，`probe` 直接返回含
 /// `SIDECAR_OFF` 的错误。所以调用方必须能把它关掉。
+///
+/// `totp_seed` 是这条配置的 TOTP 种子（没配传 `None`）：二次验证问到验证码时
+/// 本地算码自动提交，不弹框；算的码被拒一次就退回「预填 + 弹框」。
 #[uniffi::export]
 pub fn connect(
     config_id: String,
@@ -206,6 +210,7 @@ pub fn connect(
     auth: AuthMethod,
     listener: Box<dyn TerminalEventListener>,
     sidecar: bool,
+    totp_seed: Option<String>,
 ) -> Result<SessionHandle, SshError> {
     let listener: Arc<dyn TerminalEventListener> = Arc::from(listener);
     let id = new_session_id();
@@ -220,6 +225,7 @@ pub fn connect(
         legacy_crypto: None,
         config_id: Some(config_id),
         sidecar: Some(sidecar),
+        totp_seed,
     };
 
     let outcome = runtime().block_on(manager().connect(listener, id.clone(), req))?;
@@ -228,6 +234,13 @@ pub fn connect(
         session_id: id,
         legacy_crypto: outcome.legacy_crypto,
     })
+}
+
+/// 校验 TOTP 种子并返回此刻的验证码（连接编辑页用来让用户和验证器 App 对一下）。
+/// 种子不合法时返回中文原因。
+#[uniffi::export]
+pub fn totp_check(seed: String) -> Result<String, SshError> {
+    totp::preview(&seed).map_err(SshError::Auth)
 }
 
 /// 往终端写字节（键入、粘贴、ZMODEM 上传……都走这一个入口）。
