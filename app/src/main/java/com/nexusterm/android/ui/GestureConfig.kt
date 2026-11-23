@@ -213,6 +213,13 @@ enum class GestureAction(val label: String, private vararg val allowedKinds: Slo
     START_SELECTION("开始选择文本", SlotKind.DISCRETE),
 
     /**
+     * 把落点下的词（有单行选区时是选区）插到命令行光标处，不执行。**只能绑离散槽位**：
+     * 要的是一个落点，滑动 / 捏合结束时手指已经不在词上了。和菜单里的「插入」是同一件事，
+     * 手势只是省掉打开菜单那一步。出厂不绑。
+     */
+    INSERT_WORD("插入点按处的词", SlotKind.DISCRETE),
+
+    /**
      * 字号增大。**只能绑捏合槽位**（缩小/放大四个都行）：字号是随捏合幅度
      * 一档一档步进的（见识别器的 PinchStepPerFontSize），需要持续的 span 变化量。
      * 离散槽位给不出幅度，滑动槽位给的是 pan 而不是 span，没有可用的输入。

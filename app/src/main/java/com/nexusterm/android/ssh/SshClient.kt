@@ -10,6 +10,7 @@ import uniffi.nexus_core.SessionException
 import uniffi.nexus_core.TerminalEventListener
 import uniffi.nexus_core.connect as uniffiConnect
 import uniffi.nexus_core.disconnect as uniffiDisconnect
+import uniffi.nexus_core.loadRemoteHistory as uniffiLoadRemoteHistory
 import uniffi.nexus_core.probe as uniffiProbe
 import uniffi.nexus_core.resize as uniffiResize
 import uniffi.nexus_core.sshReadFile as uniffiSshReadFile
@@ -82,6 +83,11 @@ object SshClient {
      *   含「兼容模式」= 本连接没开旁路；其余文本（文件超限 / `cat` 的 stderr / 读取超时）可直接展示；
      *   `NotFound` = 会话已不在。
      */
+    /** 远端 shell 的命令历史（从旧到新），见 nexus-core `load_remote_history`。错误形状同 [probe]。 */
+    suspend fun loadRemoteHistory(sessionId: String): List<String> = withContext(Dispatchers.IO) {
+        uniffiLoadRemoteHistory(sessionId)
+    }
+
     suspend fun readFile(sessionId: String, path: String, max: Long): ByteArray =
         withContext(Dispatchers.IO) {
             uniffiSshReadFile(sessionId, path, max.toULong())

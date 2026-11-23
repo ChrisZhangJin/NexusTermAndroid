@@ -46,6 +46,14 @@ class RemoteViewPathTest {
         assertEquals("word.md", pickViewTarget("a.md\nb.md", "word.md"))
     }
 
+    @Test fun firstViewableWordWins() {
+        // 两指中点落在提示符上、某根手指落在文件上：跳过不可浏览的，取第一个能开的
+        assertEquals("b.md", pickViewTarget("", listOf("user@host:~\$", "", "b.md", "c.png")))
+        assertEquals("/a/sel.md", pickViewTarget("/a/sel.md", listOf("b.md")))
+        assertNull(pickViewTarget("", listOf("ls", "README", "")))
+        assertNull(pickViewTarget("", emptyList()))
+    }
+
     @Test fun autoPickedWordRequiresExtension() {
         assertNull(pickViewTarget("", "user@host:~/path\$"))
         assertNull(pickViewTarget("", "ls"))

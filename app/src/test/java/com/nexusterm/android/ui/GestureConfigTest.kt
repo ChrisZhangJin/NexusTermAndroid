@@ -344,18 +344,20 @@ class GestureConfigTest {
         assertFalse(GestureAction.FONT_SIZE_UP in onDiscrete)
         assertFalse(GestureAction.FONT_SIZE_DOWN in onDiscrete)
         assertTrue(GestureAction.START_SELECTION in onDiscrete)
+        assertTrue(GestureAction.INSERT_WORD in onDiscrete)
 
-        // 滑动槽位：没有字号增减，也没有选择文本。
+        // 滑动槽位：没有字号增减，也没有选择文本、插入点按处的词（都要一个落点）。
         val onSwipe = GestureAction.allowedActionsFor(GestureSlot.THREE_FINGER_SWIPE_UP)
-        assertEquals(GestureAction.entries.size - 3, onSwipe.size)
+        assertEquals(GestureAction.entries.size - 4, onSwipe.size)
+        assertFalse(GestureAction.INSERT_WORD in onSwipe)
         assertTrue(GestureAction.CLEAR_SCREEN in onSwipe)
         assertTrue(GestureAction.OPEN_SWITCHER in onSwipe)
         assertFalse(GestureAction.FONT_SIZE_UP in onSwipe)
         assertFalse(GestureAction.START_SELECTION in onSwipe)
 
-        // 捏合槽位：没有选择文本，字号增减在。
+        // 捏合槽位：没有选择文本、插入点按处的词，字号增减在。
         val onPinch = GestureAction.allowedActionsFor(GestureSlot.TWO_FINGER_PINCH_OUT)
-        assertEquals(GestureAction.entries.size - 1, onPinch.size)
+        assertEquals(GestureAction.entries.size - 2, onPinch.size)
         assertTrue(GestureAction.FONT_SIZE_UP in onPinch)
         assertTrue(GestureAction.FONT_SIZE_DOWN in onPinch)
         assertFalse(GestureAction.START_SELECTION in onPinch)

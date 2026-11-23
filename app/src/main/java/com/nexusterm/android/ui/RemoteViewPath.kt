@@ -19,14 +19,19 @@ fun cleanViewCandidate(raw: String): String? {
 
 /**
  * 菜单「浏览」的目标：[selection]（用户明确选中的）能解析成可浏览文件就用它——这是明确意图，
- * 不要求扩展名，所以 README 这类无扩展名文件选中后能开；否则退到落点下的 [word]，
- * 并且**要求带扩展名**：整行没有空格的 `user@host:~/path$` 会被当成一个词，若放行「无扩展名
+ * 不要求扩展名，所以 README 这类无扩展名文件选中后能开；否则按顺序看自动取到的 [words]
+ * （手指落点下的词、终端光标处的词，见 index.html 的 NexusTerm.viewTarget），取第一个
+ * **带扩展名**的可浏览文件：整行没有空格的 `user@host:~/path$` 会被当成一个词，若放行「无扩展名
  * 当纯文本」就会拿它去 `cat`。都不行返回 null。
  */
-fun pickViewTarget(selection: String, word: String): String? {
+fun pickViewTarget(selection: String, words: List<String>): String? {
     cleanViewCandidate(selection)?.takeIf { viewableKind(it) != null }?.let { return it }
-    return cleanViewCandidate(word)?.takeIf { viewableKind(it, requireExt = true) != null }
+    return words.firstNotNullOfOrNull { w ->
+        cleanViewCandidate(w)?.takeIf { viewableKind(it, requireExt = true) != null }
+    }
 }
+
+fun pickViewTarget(selection: String, word: String): String? = pickViewTarget(selection, listOf(word))
 
 /** 绝对路径（`/…`）或家目录路径（`~`、`~/…`）：不需要知道 shell 当前目录。 */
 fun isAbsoluteRemotePath(p: String): Boolean = p.startsWith("/") || p == "~" || p.startsWith("~/")

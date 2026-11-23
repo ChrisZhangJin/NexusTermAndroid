@@ -390,6 +390,9 @@ fun TerminalTabsPager(
     var menuAt by remember { mutableStateOf<Offset?>(null) }
     // 菜单是不是键盘打开的：键盘没有手指落点，「浏览」就不去取落点下的词（见 TerminalMenu）。
     var menuByKeyboard by remember { mutableStateOf(false) }
+    // 打开菜单的那次手势里每根手指的落点（px）。两指中点常落在两指之间的空白上，
+    // 「浏览」要连每根手指下的词一起看，才能「手指按在文件名上」就认出文件。
+    var menuFingers by remember { mutableStateOf<List<Offset>>(emptyList()) }
 
     // The span the pinch last stepped the font at; see PinchStepPerFontSize.
     var pinchRefSpan by remember { mutableFloatStateOf(0f) }
@@ -415,6 +418,26 @@ fun TerminalTabsPager(
 
     // 命令历史面板（底部抽屉，独立窗口），和上面几个对话框同一个约定。键盘栏的 HIST 键和终端菜单都开它。
     var showHistory by remember { mutableStateOf(false) }
+    // 编辑框（底部抽屉），键栏的 ✎ 键和终端菜单都开它。
+    var showCompose by remember { mutableStateOf(false) }
+
+    // 查找条（盖在终端顶部）和「标记」对话框。查找条属于它打开时的那个终端：切标签 / 关切换器
+    // 时收掉（见下面的 LaunchedEffect），免得条里的关键字对着另一个终端。seed = 打开时的选中文字。
+    var showFind by remember { mutableStateOf(false) }
+    var showMark by remember { mutableStateOf(false) }
+    var findSeed by remember { mutableStateOf("") }
+    var markSeed by remember { mutableStateOf("") }
+    // 查找条底边的 y（本 Box 的 px）；手势识别器据此放过落在条上的触摸，同按键栏。
+    var findBarBottomPx by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(activeIndex) { showFind = false }
+    LaunchedEffect(isOpen) { if (isOpen) showFind = false }
+
+    /** 打开查找 / 标记：先取一下选区当种子（异步），回来再亮出来。 */
+    fun openFind() { activeHandle.readSelection { findSeed = it; showFind = true } }
+    fun openMark() { activeHandle.readSelection { markSeed = it; showMark = true } }
+
+    // 补全建议条在本 Box 里的位置（隐藏时 null）：手势识别器放过落在它上面的触摸。
+    var completionBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
 
     // 整个终端区域的像素尺寸，只为「终端菜单」快捷键找个锚点（区域中心）。
     var areaSize by remember { mutableStateOf(IntSize.Zero) }
@@ -438,7 +461,10 @@ fun TerminalTabsPager(
         handle = tabs[activeIndex].handle,
         enabled = !isOpen,
     )
-    SideEffect { keyBar.onHistory = { showHistory = true } }
+    SideEffect {
+        keyBar.onHistory = { showHistory = true }
+        keyBar.onCompose = { showCompose = true }
+    }
     val keyBarHeightPx = with(LocalDensity.current) { TerminalKeyBarHeight.toPx() }
     val pinchStepPx = with(LocalDensity.current) { PinchStepPerFontSize.toPx() }
 
@@ -574,7 +600,7 @@ fun TerminalTabsPager(
      */
     fun performShortcut(action: ShortcutAction): Boolean {
         // 对话框开着时按键到不了这里（对话框是独立窗口，自己收按键）；万一到了也别动手。
-        if (renamingId != null || closeConfirmId != null || showHelp || showHistory) return true
+        if (renamingId != null || closeConfirmId != null || showHelp || showHistory || showMark || showCompose) return true
         // 任何快捷键都算「别的键」：撤销切换器里待确认的断开。
         closeArm = closeArm.disarm()
         // 切换器开着时终端本身是被盖住的（手势那边也只在关着的时候识别），所以只有标签类
@@ -647,7 +673,7 @@ fun TerminalTabsPager(
     fun handleSwitcherKey(keyCode: Int): Boolean {
         // 和 userScrollEnabled 同一个阈值：过半才算「打开了」，收起动画的尾巴不再响应。
         if (progress.value <= 0.5f) return false
-        if (renamingId != null || closeConfirmId != null || showHelp || showHistory) return false
+        if (renamingId != null || closeConfirmId != null || showHelp || showHistory || showMark || showCompose) return false
         // 除了 Backspace / Delete 自己，任何键都撤销待确认的断开。
         if (keyCode != KeyEvent.KEYCODE_DEL && keyCode != KeyEvent.KEYCODE_FORWARD_DEL) {
             closeArm = closeArm.disarm()
@@ -719,6 +745,8 @@ fun TerminalTabsPager(
                 // The key bar handles its own touches (including the
                 // one-finger page swipe); nothing that starts on it is ours.
                 barTop = { height -> if (keyBar.onScreen) height - keyBarHeightPx else Float.MAX_VALUE },
+                topBlock = { if (showFind) findBarBottomPx else 0f },
+                overlayHit = { p -> completionBounds?.contains(p) == true },
                 isSelecting = { selecting != null },
                 progressAtStart = { progress.value },
                 onSwitcherDrag = { startProgress, dy ->
@@ -757,9 +785,21 @@ fun TerminalTabsPager(
                 // The buzz comes at the end of the hold, the action only at the
                 // lift: see Touch.HOLD_ARMED for why the two are split.
                 onHoldArmed = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) },
-                onMenu = {
+                onMenu = { at, fingers ->
                     menuByKeyboard = false
-                    menuAt = it
+                    menuFingers = fingers
+                    menuAt = at
+                },
+                onInsertWord = { at, fingers ->
+                    val handle = activeHandle
+                    val points = (listOf(at) + fingers).distinct().map { Offset(it.x / density, it.y / density) }
+                    handle.readViewTarget(points) { sel, words, pointWords ->
+                        val w = pickInsertTarget(sel, words.take(pointWords))
+                        if (w != null) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            handle.insertText(w)
+                        }
+                    }
                 },
                 // Pointer positions are relative to this Box, whose top-left is
                 // also the WebView's (the pager is only inset at the bottom),
@@ -1016,6 +1056,13 @@ fun TerminalTabsPager(
             modifier = Modifier.align(Alignment.BottomCenter),
         )
 
+        // 补全建议条：只在终端正常显示时（切换器收起、不在选择文字）出现。
+        if (!isOpen && selecting == null) {
+            CompletionStrip(activeHandle) { completionBounds = it }
+        } else {
+            LaunchedEffect(Unit) { completionBounds = null }
+        }
+
         // 键盘断开的待确认提示：盖在卡片上方，不拦触摸、不抢焦点（所以不是对话框）。
         // 取 targetPage 那张的名字，和 handleSwitcherKey 断开的是同一张；换卡片 / 超时
         // 时 closeArm 会被撤销，这里自然消失。
@@ -1045,8 +1092,40 @@ fun TerminalTabsPager(
                 onPaste = { pasteFromClipboard() },
                 onShowHelp = { showHelp = true },
                 onShowHistory = { showHistory = true },
+                onCompose = { showCompose = true },
+                onReadMode = {
+                    val tab = tabs[activeIndex]
+                    tab.handle.readBufferText { text ->
+                        if (text.isBlank()) {
+                            Toast.makeText(context, "终端里还没有内容", Toast.LENGTH_SHORT).show()
+                            return@readBufferText
+                        }
+                        scope.launch {
+                            runCatching {
+                                ViewerLauncher.open(
+                                    context,
+                                    name = "${tab.name} · 终端输出.txt",
+                                    source = "${tab.name} · 终端输出",
+                                    kind = ViewableKind.CODE,
+                                    bytes = text.toByteArray(Charsets.UTF_8),
+                                    wrap = true,
+                                    tail = true,
+                                )
+                            }.onFailure {
+                                Toast.makeText(context, "打开阅读模式失败：${it.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                },
+                onFind = { openFind() },
+                onMark = { openMark() },
                 // 坐标换算同 onSelectStart：菜单锚点是这个 Box 的 px，页面里 1 px = 1 dp。
-                viewPoint = if (menuByKeyboard) null else Offset(at.x / density, at.y / density),
+                // 先看中点（单指手势就是手指本身），再看每根手指。
+                viewPoints = if (menuByKeyboard) {
+                    emptyList()
+                } else {
+                    (listOf(at) + menuFingers).distinct().map { Offset(it.x / density, it.y / density) }
+                },
                 onView = { path -> onViewFile(tabs[activeIndex].id, path) },
                 onOpenSftp = { onOpenSftp(tabs[activeIndex].id) },
                 onDisconnect = { onCloseTab(tabs[activeIndex].id) },
@@ -1087,8 +1166,38 @@ fun TerminalTabsPager(
         // 终端菜单里的「操作说明」。HelpDialog 自己就是 Compose 对话框（独立窗口），
         // 开着的时候触摸和按键都到不了下面的终端；快捷键表传 gestureConfig.shortcuts，
         // 这样显示的是用户改绑后的键位。
+        // 查找条：盖在终端顶部。关的时候把按键交还给终端（有硬键盘时）。
+        if (showFind && !isOpen) {
+            FindBar(
+                handle = activeHandle,
+                seed = findSeed,
+                onClose = {
+                    showFind = false
+                    if (hasHardKeyboard) hardKeyFocusRequest++
+                },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .onSizeChanged { findBarBottomPx = it.height.toFloat() },
+            )
+        }
+
+        if (showMark) {
+            MarkDialog(
+                handle = activeHandle,
+                seed = markSeed,
+                onDismiss = {
+                    showMark = false
+                    if (hasHardKeyboard) hardKeyFocusRequest++
+                },
+            )
+        }
+
         if (showHistory) {
             HistorySheet(handle = tabs[activeIndex].handle, onDismiss = { showHistory = false })
+        }
+
+        if (showCompose) {
+            ComposeSheet(handle = tabs[activeIndex].handle, onDismiss = { showCompose = false })
         }
 
         if (showHelp) {
@@ -1380,19 +1489,26 @@ private fun TerminalMenu(
     onPaste: () -> Unit,
     onShowHelp: () -> Unit,
     onShowHistory: () -> Unit,
-    /** 落点的页面坐标（dp）；null = 键盘打开的菜单，没有落点，只看选区。 */
-    viewPoint: Offset?,
+    onCompose: () -> Unit,
+    onReadMode: () -> Unit,
+    onFind: () -> Unit,
+    onMark: () -> Unit,
+    /** 按优先级排的落点页面坐标（dp）；空 = 键盘打开的菜单，没有落点，只看选区和光标。 */
+    viewPoints: List<Offset>,
     onView: (String) -> Unit,
     onOpenSftp: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
     // 「浏览」的目标在菜单打开时向页面问一次（异步，几毫秒）：选区优先，其次落点下的词，
-    // 规则见 pickViewTarget。回来之前、或没有可浏览的文件时，这一项是灰的「浏览」，
+    // 最后终端光标处的词，规则见 pickViewTarget。回来之前、或没有可浏览的文件时，这一项是灰的「浏览」，
     // 不让菜单高度在结果回来时跳变。
     var viewPath by remember(anchor) { mutableStateOf<String?>(null) }
+    // 「插入」：落点下的词（或单行选区）插到命令行上，见 pickInsertTarget。同一次读取。
+    var insertWord by remember(anchor) { mutableStateOf<String?>(null) }
     LaunchedEffect(anchor) {
-        handle.readViewTarget(viewPoint?.x ?: 0f, viewPoint?.y ?: 0f, viewPoint != null) { sel, word ->
-            viewPath = pickViewTarget(sel, word)
+        handle.readViewTarget(viewPoints) { sel, words, pointWords ->
+            viewPath = pickViewTarget(sel, words)
+            insertWord = pickInsertTarget(sel, words.take(pointWords))
         }
     }
     // A zero-size box at the touch point, so the menu opens where the
@@ -1402,6 +1518,23 @@ private fun TerminalMenu(
             DropdownMenuItem(
                 text = { Text("粘贴") },
                 onClick = { onDismiss(); onPaste() },
+            )
+            // 紧跟「粘贴」：都是「往命令行上放东西」。没取到词时是灰的「插入」，理由同「浏览」。
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        insertWord?.let { "插入「$it」" } ?: "插入",
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 220.dp),
+                    )
+                },
+                enabled = insertWord != null,
+                onClick = { val w = insertWord; onDismiss(); if (w != null) handle.insertText(w) },
+            )
+            DropdownMenuItem(
+                text = { Text("编辑框输入…") },
+                onClick = { onDismiss(); onCompose() },
             )
             DropdownMenuItem(
                 text = { Text("清屏") },
@@ -1430,6 +1563,20 @@ private fun TerminalMenu(
             // 手势和快捷键恰恰是在终端里用的，所以终端菜单里要能直接查到。不放在最末，
             // 是因为「断开」是破坏性操作、必须留在最底下；帮助紧贴着它的话，手指落点一偏就
             // 把会话断了。放在这里，下面隔着一条分割线和 SFTP 才轮到「断开」，误点最多是弹个说明。
+            // 阅读模式：整个滚动历史放进查看器，按手机宽度自动换行、可缩放、可「复制全部」。
+            DropdownMenuItem(
+                text = { Text("阅读模式") },
+                onClick = { onDismiss(); onReadMode() },
+            )
+            DropdownMenuItem(
+                text = { Text("查找…") },
+                onClick = { onDismiss(); onFind() },
+            )
+            DropdownMenuItem(
+                text = { Text("标记…") },
+                trailingIcon = { if (handle.markCount > 0) Text("${handle.markCount} 条生效") },
+                onClick = { onDismiss(); onMark() },
+            )
             DropdownMenuItem(
                 text = { Text("命令历史") },
                 onClick = { onDismiss(); onShowHistory() },
@@ -1709,6 +1856,10 @@ private fun Modifier.terminalGestures(
     config: GestureConfig,
     topExclusionFraction: Float,
     barTop: (height: Float) -> Float,
+    /** 顶部查找条占的高度（px）；起点落在它上面的触摸不归手势识别器。0 = 没有条。 */
+    topBlock: () -> Float,
+    /** 起点落在浮层（补全建议条）上的触摸也不归手势识别器。 */
+    overlayHit: (Offset) -> Boolean,
     isSelecting: () -> Boolean,
     progressAtStart: () -> Float,
     onSwitcherDrag: (startProgress: Float, dy: Float) -> Unit,
@@ -1718,7 +1869,10 @@ private fun Modifier.terminalGestures(
     onPinch: (span: Float, centroid: Offset) -> Unit,
     onPinchEnd: () -> Unit,
     onHoldArmed: () -> Unit,
-    onMenu: (Offset) -> Unit,
+    /** (菜单锚点 = 手势落点, 多指手势里每根手指按下时的位置；单指手势为空) */
+    onMenu: (at: Offset, fingers: List<Offset>) -> Unit,
+    /** 「插入点按处的词」，参数同 [onMenu]。 */
+    onInsertWord: (at: Offset, fingers: List<Offset>) -> Unit,
     onSelectStart: (Offset) -> Unit,
     onSelectDrag: (at: Offset, bounds: Offset) -> Unit,
     onSelectEnd: () -> Unit,
@@ -1769,10 +1923,11 @@ private fun Modifier.terminalGestures(
      * 里本来就各有一项，虚拟大窗口菜单里是切换项、这里拆成单向的开/关，手势只是
      * 它们的第二个入口，走的是同一个回调、同一份状态。
      */
-    fun perform(action: GestureAction, at: Offset) {
+    fun perform(action: GestureAction, at: Offset, fingers: List<Offset> = emptyList()) {
         when (action) {
             GestureAction.NONE -> {}
-            GestureAction.OPEN_MENU -> onMenu(at)
+            GestureAction.OPEN_MENU -> onMenu(at, fingers)
+            GestureAction.INSERT_WORD -> onInsertWord(at, fingers)
             GestureAction.OPEN_SWITCHER -> onSwitcherOpen()
             GestureAction.START_SELECTION -> onSelectStart(at)
             GestureAction.PASTE -> onPaste()
@@ -1799,7 +1954,7 @@ private fun Modifier.terminalGestures(
         val first = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
         val bounds = Offset(size.width.toFloat(), size.height.toFloat())
 
-        if (first.position.y >= barTop(bounds.y)) {
+        if (first.position.y >= barTop(bounds.y) || first.position.y < topBlock() || overlayHit(first.position)) {
             do {
                 val event = awaitPointerEvent(PointerEventPass.Initial)
             } while (event.changes.any { it.pressed })
@@ -1830,6 +1985,8 @@ private fun Modifier.terminalGestures(
         // 继续等长按。见上面的 KDoc。
         var verdictLocked = false
         var startCentroid = Offset.Zero
+        // 每根手指按下时的位置：多指手势打开菜单时交给「浏览」逐个取词。
+        var startPoints = emptyList<Offset>()
         var startSpan = 0f
         var centroid = Offset.Zero
         var curSpan = 0f
@@ -1849,6 +2006,7 @@ private fun Modifier.terminalGestures(
             // pointers that were already down on the previous event, which
             // leaves out the finger that just landed.
             startCentroid = down.centroid()
+            startPoints = down.map { it.position }
             startSpan = down.span(startCentroid)
             centroid = startCentroid
             curSpan = startSpan
@@ -1997,7 +2155,7 @@ private fun Modifier.terminalGestures(
                         startedAt - lastTwoFingerTapAt <= thresholds.twoFingerDoubleTapWindowMs
                     ) {
                         lastTwoFingerTapAt = 0L
-                        perform(twoFingerDoubleTap, startCentroid)
+                        perform(twoFingerDoubleTap, startCentroid, startPoints)
                         mode = Touch.IGNORED
                     }
                 }
@@ -2067,7 +2225,7 @@ private fun Modifier.terminalGestures(
                         // to since. 同样不降级：三指抬起一根不会变成双指手势。
                         part.size < fingers -> {
                             if (mode == Touch.HOLD_ARMED) {
-                                perform(if (fingers == 3) threeFingerHold else twoFingerHold, startCentroid)
+                                perform(if (fingers == 3) threeFingerHold else twoFingerHold, startCentroid, startPoints)
                             } else if (fingers == 2 && twoFingerDoubleTap != GestureAction.NONE) {
                                 // 还在 UNDECIDED 就抬手 = 没到长按时限、也没走出
                                 // slop（走出了早就转去 SWITCHER/PINCH/IGNORED 了），
@@ -2171,7 +2329,7 @@ private fun Modifier.terminalGestures(
                                         else -> {
                                             // 一次性动作：方向判出的这一刻触发一次，
                                             // 剩下的部分 IGNORED 消费掉。
-                                            perform(action, startCentroid)
+                                            perform(action, startCentroid, startPoints)
                                             mode = Touch.IGNORED
                                         }
                                     }

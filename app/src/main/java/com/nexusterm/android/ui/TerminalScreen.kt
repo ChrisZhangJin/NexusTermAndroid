@@ -99,6 +99,32 @@ class TerminalHandle internal constructor(
     var virtualWindow: Boolean = true
         private set
 
+
+    /**
+     * 提示符之后已经敲出来的这半句，和它在页面上占的纵向范围（dp，从 WebView 顶部算），
+     * 补全建议条据此决定显示什么、浮在哪儿。null = 现在说不清（没认出提示符、全屏程序、
+     * 翻在历史里、光标不在行尾），建议条隐藏。页面推过来，见 index.html 的 reportLine。
+     */
+    data class InputLine(val text: String, val top: Float, val bottom: Float)
+
+    var inputLine by mutableStateOf<InputLine?>(null)
+        private set
+
+    internal fun onInputLine(line: InputLine?) {
+        webView.post { inputLine = line }
+    }
+
+    /** 每记下一条命令加一：补全那边据此重新读本机历史，而不是每敲一个字读一次盘。 */
+    var historyVersion by mutableIntStateOf(0)
+        private set
+
+    internal fun onCommandRecorded() {
+        webView.post { historyVersion++ }
+    }
+
+    /** 远端 shell 的历史（最新的在前），连接后读一次（MainActivity.loadRemoteHistory）；读不到就是空。 */
+    var remoteHistory by mutableStateOf<List<String>>(emptyList())
+
     /** 一条标记规则：[color] 是 #RRGGBB，[text] 是要高亮的文字。 */
     data class MarkRule(val color: String, val text: String)
 
@@ -309,6 +335,22 @@ class TerminalHandle internal constructor(
         if (run) webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.sendKeyBase64('DQ==');", null)
     }
 
+    /**
+     * 整个缓冲区（含滚动历史）的纯文字，给「阅读模式」（index.html 的 NexusTerm.bufferText）。
+     * 页面没起来 / 解不出来回调空串。
+     */
+    fun readBufferText(onText: (String) -> Unit) {
+        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.bufferText() : ''") { raw ->
+            val text = runCatching { JSONArray("[$raw]").optString(0, "") }.getOrDefault("")
+            onText(if (raw == "null") "" else text)
+        }
+    }
+
+    /** 按一下回车（编辑框在非提示符场景下「执行」用）。 */
+    fun sendEnter() {
+        webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.sendKeyBase64('DQ==');", null)
+    }
+
     fun clearScreen() {
         webView.evaluateJavascript("window.NexusTerm && window.NexusTerm.clearScreen();", null)
     }
@@ -394,15 +436,31 @@ class TerminalHandle internal constructor(
 
     /**
      * 终端菜单「浏览」的候选（见 index.html 的 NexusTerm.viewTarget）：[onResult] 收到
-     * (选区文字, 落点词)，都是原始文字，取舍交给 [pickViewTarget]。([x], [y]) 是页面坐标（dp）；
-     * [usePoint] = false 时不取落点词（键盘打开的菜单没有手指落点）。只读，不碰选区。
-     * 页面还没起来 / 结果解不出来都按两个空串回调，菜单项就保持不可用。
+     * (选区文字, 按优先级排好的词)，都是原始文字，取舍交给 [pickViewTarget]。[points] 是页面
+     * 坐标（dp），依次取每个点下的词；空 = 键盘打开的菜单，没有手指落点。终端光标处的词总在
+     * 最后。只读，不碰选区。页面还没起来 / 结果解不出来都按空回调，菜单项就保持不可用。
      */
-    fun readViewTarget(x: Float, y: Float, usePoint: Boolean, onResult: (selection: String, word: String) -> Unit) {
-        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.viewTarget($x, $y, $usePoint) : ''") { raw ->
+    fun readViewTarget(
+        points: List<Offset>,
+        onResult: (selection: String, words: List<String>, pointWords: Int) -> Unit,
+    ) {
+        val js = points.joinToString(",", "[", "]") { "[${it.x},${it.y}]" }
+        webView.evaluateJavascript("window.NexusTerm ? window.NexusTerm.viewTarget($js) : ''") { raw ->
             val o = runCatching { JSONObject(JSONArray("[$raw]").optString(0, "")) }.getOrNull()
-            onResult(o?.optString("sel", "").orEmpty(), o?.optString("word", "").orEmpty())
+            val arr = o?.optJSONArray("words")
+            val words = if (arr == null) emptyList() else List(arr.length()) { arr.optString(it, "") }
+            onResult(o?.optString("sel", "").orEmpty(), words, o?.optInt("pointWords", 0) ?: 0)
         }
+    }
+
+    /**
+     * 把终端里的一个词 / 选中的文字插到命令行光标处（走粘贴，不执行）。已经敲了半句且末尾不是
+     * 空格时先补一个空格，免得和前一个词粘在一起（`cat` + `a.md` → `cat a.md`）。
+     */
+    fun insertText(text: String) {
+        val typed = inputLine?.text
+        val sep = if (!typed.isNullOrEmpty() && !typed.last().isWhitespace()) " " else ""
+        paste(sep + text)
     }
 
     /**
@@ -512,6 +570,7 @@ fun createTerminal(
     // 页面推来的查找结果要交给 handle，而 handle 要等 WebView 建好才有：先放个转接。
     var searchSink: (Int, Int) -> Unit = { _, _ -> }
     // 同上：输入行 / 新命令要交给 handle。handle 建好之前页面还没加载，不会有回调。
+    lateinit var lineSink: TerminalHandle
     val webView = WebView(context).apply {
         // Without explicit layoutParams, a WebView attached by an
         // AndroidView can end up measured at a near-zero height — Blink's
@@ -551,6 +610,13 @@ fun createTerminal(
                 @JavascriptInterface
                 fun onCommand(cmd: String) {
                     CommandHistory.record(context, historyKey, cmd)
+                    lineSink.onCommandRecorded()
+                }
+
+                // 当前输入行（补全建议条用），见 index.html 的 reportLine。
+                @JavascriptInterface
+                fun onInputLine(known: Boolean, text: String, top: Float, bottom: Float) {
+                    lineSink.onInputLine(if (known) TerminalHandle.InputLine(text, top, bottom) else null)
                 }
 
                 // 查找命中数：画高亮是延时的，页面算完才推过来（NexusTerm.find）。
@@ -569,6 +635,7 @@ fun createTerminal(
 
     val handle = TerminalHandle(webView, startFontSize, historyKey)
     searchSink = handle::onSearchResult
+    lineSink = handle
     webView.webViewClient = object : WebViewClient() {
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)

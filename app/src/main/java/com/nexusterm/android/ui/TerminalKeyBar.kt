@@ -1,7 +1,13 @@
 package com.nexusterm.android.ui
 
+import android.content.Context
+import android.os.Build
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Base64
+import android.view.HapticFeedbackConstants
 import android.view.View
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
@@ -15,6 +21,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,6 +55,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
@@ -77,6 +86,13 @@ private val IdleKeyText = Color(0xFFE6E6E6)
 
 /** Armed modifiers invert — the one state a glance mid-command has to pick out. */
 private val ArmedKey = Color(0xFF5DCAA5)
+/** 按下时的底色：比 [IdleKey] / [ArmedKey] 明显亮（暗）一档，一眼看得出「按到了」。 */
+private val PressedKey = Color(0xFF55555E)
+private val PressedArmedKey = Color(0xFF3FA583)
+/** 一次按键震动的时长。20ms 在荣耀上实测几乎感觉不到（转子还没转起来就停了），所以拉长并用满振幅。 */
+private const val KEY_TICK_MS = 45L
+/** 手指抬起后底色多留这么久：快速点按一帧就过去，不留一下根本看不见。 */
+private const val PRESS_FLASH_MS = 90L
 private val ArmedKeyText = Color(0xFF0F2A23)
 
 private val PageDot = Color(0xFF4A4A50)
@@ -146,7 +162,7 @@ private val SwipeCommit = 40.dp
 internal enum class StickyModifier { CTRL, ALT }
 
 /** Caps that open something of the app's own instead of sending bytes. */
-internal enum class BarAction { HISTORY }
+internal enum class BarAction { HISTORY, COMPOSE }
 
 /**
  * One cap. Exactly one of [payload]/[sticky]/[action] is set: the sticky
@@ -174,6 +190,9 @@ private val ROW_ONE = listOf(
 )
 
 private val ROW_TWO = listOf(
+    // 编辑框（ComposeSheet）：用原生输入框编辑整条命令。放第一页最左：打长命令 / 中文 / 语音
+    // 时就是要它，不该翻页去找。
+    KeyDef("✎", action = BarAction.COMPOSE),
     KeyDef("_", "_"),
     KeyDef("CTRL", sticky = StickyModifier.CTRL),
     KeyDef("ALT", sticky = StickyModifier.ALT),
@@ -329,10 +348,17 @@ class TerminalKeyBarState internal constructor(handle: TerminalHandle) {
     /** Opens the command-history panel; wired by the pager, which owns the sheet. */
     internal var onHistory: () -> Unit = {}
 
+    /** Opens the compose sheet; wired by the pager, same as [onHistory]. */
+    internal var onCompose: () -> Unit = {}
+
     internal fun onKey(key: KeyDef) {
         noteActivity()
         if (key.action == BarAction.HISTORY) {
             onHistory()
+            return
+        }
+        if (key.action == BarAction.COMPOSE) {
+            onCompose()
             return
         }
         val sticky = key.sticky
@@ -717,11 +743,32 @@ private fun KeyCap(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    // 按下立刻亮，抬起后再多留 PRESS_FLASH_MS，见常量注释。
+    var lit by remember { mutableStateOf(false) }
+    LaunchedEffect(pressed) {
+        if (pressed) lit = true else { delay(PRESS_FLASH_MS); lit = false }
+    }
+    val tick = rememberKeyTick()
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(KeyCorner))
-            .background(if (armed) ArmedKey else IdleKey)
-            .clickable(onClick = onClick),
+            .background(
+                when {
+                    lit && armed -> PressedArmedKey
+                    lit -> PressedKey
+                    armed -> ArmedKey
+                    else -> IdleKey
+                },
+            )
+            // 不画涟漪：底色变化已经是反馈，涟漪叠上去在深色底上反而发脏。
+            // 震动放在抬手（点击成立）时而不是按下时——按键栏支持左右滑动翻页，
+            // 从键上起手的滑动不应该每次都先震一下。
+            .clickable(interactionSource = interaction, indication = null) {
+                tick()
+                onClick()
+            },
         contentAlignment = Alignment.Center,
     ) {
         Text(
@@ -731,5 +778,32 @@ private fun KeyCap(
             fontSize = 13.sp,
             maxLines = 1,
         )
+    }
+}
+
+/**
+ * 按键的震动反馈。直接驱动马达，而不是 `View.performHapticFeedback`：后者受系统
+ * 「触摸反馈」开关管，不少国产系统默认关着、或者把键盘震动调得几乎感觉不到，
+ * 用户按了键等于没有反馈。没有马达的设备退回到 View 的触感反馈。
+ */
+@Composable
+private fun rememberKeyTick(): () -> Unit {
+    val context = LocalContext.current
+    val view = LocalView.current
+    val vibrator = remember(context) {
+        if (Build.VERSION.SDK_INT >= 31) {
+            context.getSystemService(VibratorManager::class.java)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+    }
+    return {
+        if (vibrator != null && vibrator.hasVibrator()) {
+            val amplitude = if (vibrator.hasAmplitudeControl()) 255 else VibrationEffect.DEFAULT_AMPLITUDE
+            vibrator.vibrate(VibrationEffect.createOneShot(KEY_TICK_MS, amplitude))
+        } else {
+            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        }
     }
 }

@@ -1055,6 +1055,9 @@ class MainActivity : ComponentActivity() {
      */
     private suspend fun probeLoop(live: LiveSession) {
         delay(PROBE_FIRST_DELAY_MS)
+        // 远端 shell 历史（补全建议条的候选）在本轮第一次探测成功后读一次：探测已经证明旁路
+        // 通道可用，不会是我们去试探一台只放行一条通道的堡垒机。重连后重读（文件可能长了）。
+        var historyLoaded = false
         while (true) {
             if (live.disposed || live.state != LinkState.CONNECTED) return
             if (SidecarPrefs.isDenied(this, live.savedSessionId)) return
@@ -1068,6 +1071,10 @@ class MainActivity : ComponentActivity() {
                         sessionId == live.liveSessionId
                     ) {
                         parseProbe(raw, System.currentTimeMillis())?.let { live.ctx = it }
+                        if (!historyLoaded) {
+                            historyLoaded = true
+                            loadRemoteHistory(live, sessionId)
+                        }
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -1088,6 +1095,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
             delay(PROBE_INTERVAL_MS)
+        }
+    }
+
+    /** 读远端 shell 历史交给终端的补全建议条。失败（没有历史文件、超时）就当没有，不打扰。 */
+    private suspend fun loadRemoteHistory(live: LiveSession, sessionId: String) {
+        try {
+            val items = SshClient.loadRemoteHistory(sessionId)
+            if (!live.disposed && sessionId == live.liveSessionId) {
+                // Rust 给的是从旧到新，补全要最新的在前。
+                live.terminal?.remoteHistory = items.asReversed().toList()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.d(TAG, "读取远端历史失败（忽略） tab=${live.tabId}: ${e.message}")
         }
     }
 

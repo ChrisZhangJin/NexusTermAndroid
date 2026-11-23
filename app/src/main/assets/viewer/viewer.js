@@ -289,7 +289,11 @@
   }
 
   function buildCode(text, lang, json) {
-    var wrap = lsGet("nx.viewer.wrap") === "1";
+    // 文档可以自带换行偏好（终端「阅读模式」：手机宽度下不换行就得左右拖，失去意义）；
+    // 自带时开关只管这一份，不改写全局偏好。
+    var docWrap = state.doc && typeof state.doc.wrap === "boolean" ? state.doc.wrap : null;
+    var wrap = docWrap !== null ? docWrap : lsGet("nx.viewer.wrap") === "1";
+    var firstPaint = true;
     var pretty = false;
     var js = json ? checkJson(text) : null;
 
@@ -325,7 +329,7 @@
         // setAttribute("checked","") 才是 true；false 在 h() 里被跳过，所以不需要额外处理
       }
       tools.appendChild(h("label", { class: "rd-chip" + (wrap ? " on" : "") }, [
-        h("input", { type: "checkbox", checked: wrap, onchange: function (e) { wrap = e.target.checked; lsSet("nx.viewer.wrap", wrap ? "1" : "0"); paint(); } }),
+        h("input", { type: "checkbox", checked: wrap, onchange: function (e) { wrap = e.target.checked; if (docWrap === null) lsSet("nx.viewer.wrap", wrap ? "1" : "0"); paint(); } }),
         "自动换行",
       ]));
       tools.appendChild(h("span", { class: "rd-spacer" }));
@@ -359,6 +363,11 @@
       code.appendChild(pre);
       scroll.textContent = "";
       scroll.appendChild(code);
+      // 终端输出最新的在最后：首次打开直接停在末尾（scrollTop 要等布局，放到下一帧）。
+      if (firstPaint && state.doc && state.doc.tail) {
+        requestAnimationFrame(function () { scroll.scrollTop = scroll.scrollHeight; });
+      }
+      firstPaint = false;
     }
     paint();
     zoomHooks.push(function () {
@@ -669,7 +678,8 @@
       var dr = await fetch("/doc", { cache: "no-store" });
       if (!dr.ok) throw new Error("HTTP " + dr.status);
       var bytes = new Uint8Array(await dr.arrayBuffer());
-      var d = { name: meta.name, source: meta.source || meta.name, kind: kind, bytes: bytes, text: "", enc: "" };
+      var d = { name: meta.name, source: meta.source || meta.name, kind: kind, bytes: bytes, text: "", enc: "",
+                wrap: typeof meta.wrap === "boolean" ? meta.wrap : null, tail: meta.tail === true };
       // 图片（SVG 源码视图除外）/ 音频 / 视频是二进制，不解码成文本；SVG 解码仅为源码视图
       if (kind !== "audio" && kind !== "video" && (kind !== "image" || isSvg(d.name))) {
         var dec = decode(bytes);

@@ -63,7 +63,21 @@
     return units.slice(a, b + 1).join("") || null;
   }
 
-  var api = { wordAt: wordAt };
+  // 手指比一格宽得多：落点正好在空白 / 分隔符上时，往左右各最多偏 NEAR_COLS 格再找，
+  // 近的优先，同距离先左后右。
+  var NEAR_COLS = 2;
+
+  /** 同 wordAt，但落点没在词里时在同一行左右 NEAR_COLS 格内找最近的词。 */
+  function wordNear(buf, row, col, cols) {
+    for (var d = 0; d <= NEAR_COLS; d++) {
+      var w = wordAt(buf, row, col - d, cols);
+      if (w) return w;
+      if (d > 0 && (w = wordAt(buf, row, col + d, cols))) return w;
+    }
+    return null;
+  }
+
+  var api = { wordAt: wordAt, wordNear: wordNear };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.NexusViewTarget = api;
 })(typeof window !== "undefined" ? window : this);

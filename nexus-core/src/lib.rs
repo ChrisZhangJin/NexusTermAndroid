@@ -8,6 +8,7 @@
 //! 它们要么是下一期功能，要么是桌面专属（见仓库里的执行计划文档）。
 
 pub mod errors;
+pub mod histfile;
 pub mod keys;
 pub mod listener;
 pub mod logging;
@@ -283,6 +284,22 @@ pub fn ssh_read_file(session_id: String, path: String, max: u64) -> Result<Vec<u
     runtime().block_on(manager().read_file(&session_id, &path, max))
 }
 
+/// 远端 shell 的命令历史（从旧到新，最多 [`histfile::MAX_ITEMS`] 条），给终端的补全建议条当候选。
+///
+/// 按远端 `$SHELL` 选文件（bash / zsh / fish 各自的历史文件，只读一个），只取尾部 2000 行，
+/// 多行命令、超长行丢弃。只读、只回传，Rust 侧不落盘不记日志（历史里常有手敲的口令）。
+/// 走旁路 exec 通道，错误形状同 [`probe`]：兼容模式 / 服务端拒绝并行通道时报错而不是给空。
+#[uniffi::export]
+pub fn load_remote_history(session_id: String) -> Result<Vec<String>, SshError> {
+    let text = runtime().block_on(manager().run_sidecar(
+        &session_id,
+        "exec sh -s",
+        Some(histfile::REMOTE_SCRIPT),
+        8,
+        "读取历史超时",
+    ))?;
+    Ok(histfile::parse(&text))
+}
 
 /// 主机指纹冲突的两边（记录里的 / 服务器这次出示的），连接因 `HostKeyMismatch` 失败后
 /// 由界面调用，把两个指纹摆给用户判断。没有冲突记录返回 `None`。

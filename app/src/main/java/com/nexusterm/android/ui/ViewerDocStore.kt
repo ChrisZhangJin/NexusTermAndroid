@@ -18,6 +18,10 @@ class ViewerDoc(
     val source: String,
     val kind: ViewableKind,
     val file: File,
+    /** 文本类：强制开 / 关自动换行（null = 用查看器的全局偏好）。终端阅读模式传 true。 */
+    val wrap: Boolean? = null,
+    /** 打开时滚到末尾（终端输出最新的在最后）。 */
+    val tail: Boolean = false,
 ) {
     /** /doc-html 要不要声明 charset=utf-8；要扫整个文件，所以只算一次。 */
     val htmlIsUtf8: Boolean by lazy {
@@ -72,7 +76,15 @@ object ViewerLauncher {
      * 并切到 IO；Activity 在调用者的协程上下文（主线程）启动。
      * @throws IOException 磁盘写失败（调用方显示「浏览失败」）
      */
-    suspend fun open(context: Context, name: String, source: String, kind: ViewableKind, bytes: ByteArray) {
+    suspend fun open(
+        context: Context,
+        name: String,
+        source: String,
+        kind: ViewableKind,
+        bytes: ByteArray,
+        wrap: Boolean? = null,
+        tail: Boolean = false,
+    ) {
         val id = UUID.randomUUID().toString().replace("-", "")
         val doc = withContext(Dispatchers.IO) {
             sweepOnce(context)
@@ -85,7 +97,7 @@ object ViewerLauncher {
                 file.delete()
                 throw e
             }
-            ViewerDoc(id, name, source, kind, file)
+            ViewerDoc(id, name, source, kind, file, wrap, tail)
         }
         ViewerDocStore.put(doc)
         val intent = Intent(context, ViewerActivity::class.java).putExtra(EXTRA_DOC_ID, id)

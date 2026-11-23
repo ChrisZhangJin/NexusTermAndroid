@@ -23,6 +23,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 按键栏的按键震动反馈，普通权限，安装时自动授予。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name=".NexusTermApplication"

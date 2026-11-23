@@ -282,6 +282,8 @@ class ViewerActivity : Activity() {
             .put("source", d.source)
             .put("kind", d.kind.wire)
             .put("size", d.file.length())
+            .put("tail", d.tail)
+            .also { j -> d.wrap?.let { j.put("wrap", it) } }
         return WebResourceResponse(
             "application/json", "utf-8", 200, "OK", baseHeaders(),
             ByteArrayInputStream(json.toString().toByteArray(Charsets.UTF_8)),
