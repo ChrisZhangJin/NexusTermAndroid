@@ -37,7 +37,9 @@ pub struct SessionHandle {
 /// 而言语义是一样的（进程死连接也必然死）。
 pub(crate) fn manager() -> &'static ssh::session::SessionManager {
     static MANAGER: OnceLock<ssh::session::SessionManager> = OnceLock::new();
-    MANAGER.get_or_init(ssh::session::SessionManager::new)
+    MANAGER.get_or_init(|| {
+        ssh::session::SessionManager::with_known_hosts(ssh::KnownHosts::persistent())
+    })
 }
 
 /// id → tokio runtime handle 没有必要，因为 Kotlin 侧每次调用都从 JNI
@@ -266,6 +268,33 @@ pub fn probe(session_id: String) -> Result<std::collections::HashMap<String, Str
 pub fn ssh_read_file(session_id: String, path: String, max: u64) -> Result<Vec<u8>, SshError> {
     let max = usize::try_from(max).unwrap_or(usize::MAX);
     runtime().block_on(manager().read_file(&session_id, &path, max))
+}
+
+
+/// 主机指纹冲突的两边（记录里的 / 服务器这次出示的），连接因 `HostKeyMismatch` 失败后
+/// 由界面调用，把两个指纹摆给用户判断。没有冲突记录返回 `None`。
+#[derive(uniffi::Record)]
+pub struct HostKeyConflict {
+    pub known: String,
+    pub presented: String,
+}
+
+#[uniffi::export]
+pub fn host_key_conflict(host: String, port: u16) -> Option<HostKeyConflict> {
+    manager()
+        .known_hosts()
+        .conflict(&host, port)
+        .map(|c| HostKeyConflict { known: c.known, presented: c.presented })
+}
+
+/// 用户确认服务器确实换过密钥：把 `fingerprint`（界面上给用户看过的那个新指纹）记为这台
+/// 主机的指纹，之后重连即可通过。终端与 SFTP 共用同一张表。
+#[uniffi::export]
+pub fn trust_host_key(host: String, port: u16, fingerprint: String) -> Result<(), StoreError> {
+    manager()
+        .known_hosts()
+        .trust(&host, port, &fingerprint)
+        .map_err(StoreError::from)
 }
 
 /// 主动断开。幂等：会话已经不存在也不报错——对应用户快速点两下「断开」

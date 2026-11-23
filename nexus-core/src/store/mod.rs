@@ -206,6 +206,16 @@ impl Store {
                 PRIMARY KEY (key, command)
             );
             CREATE INDEX IF NOT EXISTS idx_history_key_time ON command_history(key, last_used_at);
+
+            -- 主机公钥指纹（Trust-on-First-Use）。按 host:port 记，首次连接时写入，
+            -- 之后指纹变了就拒绝连接 —— 只有落盘才防得住「重启应用后再被中间人」。
+            CREATE TABLE IF NOT EXISTS known_hosts (
+                host        TEXT NOT NULL,
+                port        INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                added_at    INTEGER NOT NULL,
+                PRIMARY KEY (host, port)
+            );
             "#,
         )
         .map_err(|e| e.to_string())?;
@@ -552,6 +562,30 @@ impl Store {
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// 记录过的主机指纹；没有返回 None（读库出错也当没有，由调用方走首次信任）。
+    pub fn get_known_host(&self, host: &str, port: u16) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT fingerprint FROM known_hosts WHERE host = ?1 AND port = ?2",
+            params![host, port],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// 写入（或覆盖）一台主机的指纹。
+    pub fn put_known_host(&self, host: &str, port: u16, fingerprint: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO known_hosts (host, port, fingerprint, added_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(host, port) DO UPDATE SET fingerprint = excluded.fingerprint,
+                                                   added_at = excluded.added_at",
+            params![host, port, fingerprint, chrono::Utc::now().timestamp()],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 

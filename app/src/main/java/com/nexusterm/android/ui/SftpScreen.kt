@@ -172,7 +172,10 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
         }
     }
 
-    LaunchedEffect(sessionId) {
+    // 主机指纹冲突、用户核对后信任了新指纹：加一，重新跑下面的连接。
+    var retryConnect by remember { mutableStateOf(0) }
+
+    LaunchedEffect(sessionId, retryConnect) {
         connecting = true
         connectError = null
         try {
@@ -210,7 +213,11 @@ fun SftpScreen(sessionId: String, onBack: () -> Unit) {
             remotePath = home
             remoteEntries = SftpClient.list(handle.handleId, home)
         } catch (e: SftpException) {
+            val rec = session
+            val asked = rec != null && (e.message ?: "").contains("指纹不匹配") &&
+                HostKeyAlerts.show(rec.host, rec.port.toInt()) { retryConnect++ }
             connectError = e.message ?: "连接失败"
+            if (asked) connectError = "主机密钥已变化，请在对话框里核对指纹"
         } catch (e: StoreException) {
             connectError = e.message ?: "无法读取会话配置"
         } finally {

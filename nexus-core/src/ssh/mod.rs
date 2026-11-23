@@ -6,11 +6,46 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// 主机公钥指纹缓存 —— 实现 Trust-on-First-Use。
+/// 主机公钥指纹表 —— 实现 Trust-on-First-Use。
 /// 首次连接时记录指纹，之后若发生变化则拒绝连接（防中间人）。
-#[derive(Debug, Default)]
+///
+/// 桌面版只记在内存里，重启即忘 —— 等于每次启动都重新「首次信任」，中间人只要挑在
+/// 重启后的第一次连接下手就不会被发现。这里可以挂一个落盘后端（[`KnownHosts::persistent`]，
+/// 会话库的 `known_hosts` 表）：内存只是缓存，查不到再问库，首次信任时一并写库。
+///
+/// 被拒的那次连接看到的新指纹记在 `rejected` 里，界面据此把「旧 / 新」两个指纹摆给用户，
+/// 用户确认服务器确实换过密钥后调 [`KnownHosts::trust`] 换成新的 —— 落盘之后这一步不能少，
+/// 否则正常重装过的服务器就永远连不上了。
+#[derive(Default)]
 pub struct KnownHosts {
     inner: Mutex<HashMap<String, String>>,
+    rejected: Mutex<HashMap<String, String>>,
+    backend: Backend,
+}
+
+#[derive(Default)]
+enum Backend {
+    /// 只在内存（测试、以及会话库还没初始化时）
+    #[default]
+    Memory,
+    /// 全局会话库（`init_store` 之后才有；之前等同于 Memory）
+    GlobalStore,
+    /// 指定的库（测试用）
+    #[cfg(test)]
+    Store(Arc<crate::store::Store>),
+}
+
+impl std::fmt::Debug for KnownHosts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KnownHosts").finish_non_exhaustive()
+    }
+}
+
+/// 指纹冲突的两边，给界面展示。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostKeyConflict {
+    pub known: String,
+    pub presented: String,
 }
 
 impl KnownHosts {
@@ -18,18 +53,51 @@ impl KnownHosts {
         Self::default()
     }
 
+    /// 落盘到全局会话库的指纹表。
+    pub fn persistent() -> Self {
+        Self { backend: Backend::GlobalStore, ..Self::default() }
+    }
+
+    #[cfg(test)]
+    fn with_store(store: Arc<crate::store::Store>) -> Self {
+        Self { backend: Backend::Store(store), ..Self::default() }
+    }
+
     fn slot(host: &str, port: u16) -> String {
         format!("{}:{}", host, port)
     }
 
-    /// 返回 Some(true) 表示指纹匹配或首次信任；Some(false) 表示指纹冲突。
-    pub fn verify(&self, host: &str, port: u16, fingerprint: &str) -> bool {
+    fn with_db<R>(&self, f: impl FnOnce(&crate::store::Store) -> R) -> Option<R> {
+        match &self.backend {
+            Backend::Memory => None,
+            Backend::GlobalStore => crate::store().map(f),
+            #[cfg(test)]
+            Backend::Store(s) => Some(f(s)),
+        }
+    }
+
+    /// 内存里没有就去库里找，找到了放进缓存。调用方持有 `map` 的锁。
+    fn lookup(&self, map: &mut HashMap<String, String>, host: &str, port: u16) -> Option<String> {
         let key = Self::slot(host, port);
+        if let Some(fp) = map.get(&key) {
+            return Some(fp.clone());
+        }
+        let fp = self.with_db(|db| db.get_known_host(host, port)).flatten()?;
+        map.insert(key, fp.clone());
+        Some(fp)
+    }
+
+    /// true = 指纹匹配或首次信任；false = 指纹与记录冲突。
+    pub fn verify(&self, host: &str, port: u16, fingerprint: &str) -> bool {
         let mut map = self.inner.lock().expect("known_hosts poisoned");
-        match map.get(&key) {
+        match self.lookup(&mut map, host, port) {
             None => {
                 tracing::info!(host = host, port = port, "首次连接，记录主机指纹");
-                map.insert(key, fingerprint.to_string());
+                map.insert(Self::slot(host, port), fingerprint.to_string());
+                if let Some(Err(e)) = self.with_db(|db| db.put_known_host(host, port, fingerprint)) {
+                    // 写库失败不挡连接（这次已经信任了），只是下次启动还会再「首次信任」一次。
+                    tracing::warn!(host = host, port = port, error = %e, "主机指纹写库失败");
+                }
                 true
             }
             Some(known) if known == fingerprint => true,
@@ -40,13 +108,98 @@ impl KnownHosts {
                     known,
                     fingerprint
                 );
+                self.rejected
+                    .lock()
+                    .expect("known_hosts poisoned")
+                    .insert(Self::slot(host, port), fingerprint.to_string());
                 false
             }
         }
     }
 
+    /// 最近一次被拒的连接：记录里的指纹和服务器这次出示的指纹。没被拒过返回 None。
+    pub fn conflict(&self, host: &str, port: u16) -> Option<HostKeyConflict> {
+        let presented = self
+            .rejected
+            .lock()
+            .expect("known_hosts poisoned")
+            .get(&Self::slot(host, port))
+            .cloned()?;
+        let mut map = self.inner.lock().expect("known_hosts poisoned");
+        let known = self.lookup(&mut map, host, port)?;
+        Some(HostKeyConflict { known, presented })
+    }
+
+    /// 用户确认过的新指纹：替换记录（内存 + 库），清掉冲突标记。
+    ///
+    /// 传入的是**用户看过的那个**指纹，而不是「清空后下次连上谁就信谁」：后者在用户点
+    /// 确认和重连之间又给了中间人一次 TOFU 的机会。
+    pub fn trust(&self, host: &str, port: u16, fingerprint: &str) -> Result<(), String> {
+        if let Some(r) = self.with_db(|db| db.put_known_host(host, port, fingerprint)) {
+            r?;
+        }
+        self.inner
+            .lock()
+            .expect("known_hosts poisoned")
+            .insert(Self::slot(host, port), fingerprint.to_string());
+        self.rejected.lock().expect("known_hosts poisoned").remove(&Self::slot(host, port));
+        Ok(())
+    }
+
     pub fn fingerprint_of(key: &PublicKey) -> String {
         key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
+    }
+}
+
+#[cfg(test)]
+mod known_hosts_tests {
+    use super::*;
+
+    fn temp_store() -> Arc<crate::store::Store> {
+        let dir = std::env::temp_dir().join(format!("nexus-kh-{}", uuid::Uuid::new_v4()));
+        Arc::new(crate::store::Store::open(dir).expect("open store"))
+    }
+
+    #[test]
+    fn first_use_is_trusted_and_survives_restart() {
+        let db = temp_store();
+        assert!(KnownHosts::with_store(db.clone()).verify("h", 22, "SHA256:aaa"));
+        // 「重启」：新实例、空缓存，同一个库
+        let again = KnownHosts::with_store(db.clone());
+        assert!(again.verify("h", 22, "SHA256:aaa"));
+        assert!(!again.verify("h", 22, "SHA256:evil"), "重启后指纹变了必须拒绝");
+    }
+
+    #[test]
+    fn ports_are_separate_hosts() {
+        let kh = KnownHosts::with_store(temp_store());
+        assert!(kh.verify("h", 22, "A"));
+        assert!(kh.verify("h", 2222, "B"));
+    }
+
+    #[test]
+    fn conflict_reports_both_sides_and_trust_replaces() {
+        let db = temp_store();
+        let kh = KnownHosts::with_store(db.clone());
+        assert!(kh.verify("h", 22, "old"));
+        assert_eq!(kh.conflict("h", 22), None);
+        assert!(!kh.verify("h", 22, "new"));
+        assert_eq!(
+            kh.conflict("h", 22),
+            Some(HostKeyConflict { known: "old".into(), presented: "new".into() })
+        );
+        kh.trust("h", 22, "new").unwrap();
+        assert_eq!(kh.conflict("h", 22), None);
+        assert!(kh.verify("h", 22, "new"));
+        // 换过之后落盘的也是新的
+        assert!(KnownHosts::with_store(db).verify("h", 22, "new"));
+    }
+
+    #[test]
+    fn memory_backend_still_works() {
+        let kh = KnownHosts::new();
+        assert!(kh.verify("h", 22, "a"));
+        assert!(!kh.verify("h", 22, "b"));
     }
 }
 

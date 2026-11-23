@@ -69,6 +69,8 @@ import com.nexusterm.android.ui.joinCwd
 import com.nexusterm.android.ui.maxBytes
 import com.nexusterm.android.ui.viewFileName
 import com.nexusterm.android.ui.viewableKind
+import com.nexusterm.android.ui.HostKeyAlertHost
+import com.nexusterm.android.ui.HostKeyAlerts
 import com.nexusterm.android.ui.SessionFormInitial
 import com.nexusterm.android.ui.SessionListScreen
 import com.nexusterm.android.ui.SftpScreen
@@ -597,7 +599,10 @@ class MainActivity : ComponentActivity() {
                         navController.navigate("terminal") { launchSingleTop = true }
                     } catch (e: SessionException) {
                         Log.e(TAG, "connect failed", e)
-                        connectError = e.friendlyText()
+                        // 指纹冲突：把新旧指纹摆给用户，核对后信任就直接再连一次。
+                        val asked = e is SessionException.HostKeyMismatch &&
+                            HostKeyAlerts.show(session.host, session.port.toInt()) { connect(session) }
+                        if (!asked) connectError = e.friendlyText()
                     } finally {
                         connectingIds.remove(session.id)
                     }
@@ -870,6 +875,8 @@ class MainActivity : ComponentActivity() {
                             SftpScreen(sessionId = sessionId, onBack = { navController.popBackStack() })
                         }
                     }
+                    // 主机指纹变化的确认框，同上。
+                    HostKeyAlertHost()
                 }
             }
         }
@@ -991,15 +998,29 @@ class MainActivity : ComponentActivity() {
             val text = (error as? SessionException)?.friendlyText() ?: error?.message ?: "未知错误"
 
             // Credentials don't repair themselves, and a keyboard-interactive
-            // host would be re-prompted on every rung of the ladder — with
-            // promptUserForAnswer still auto-cancelling that can never succeed,
-            // it just burns ten attempts and ten 2FA codes. Stop and say so.
+            // host would be re-prompted on every rung of the ladder: once the
+            // user has been asked (and cancelled, timed out, or typed a wrong
+            // code) retrying would just pop the dialog ten more times and burn
+            // ten 2FA codes. Stop and say so. 配了 TOTP 种子时验证码是 Rust 自动
+            // 填的、不会问人，sawAuthPrompt 保持 false，掉线重连照常无人值守地进行。
             if (live.sawAuthPrompt ||
                 error is SessionException.Auth ||
                 error is SessionException.HostKeyMismatch
             ) {
                 live.state = LinkState.CLOSED
                 live.statusSuffix = "（已断开）"
+                if (error is SessionException.HostKeyMismatch &&
+                    HostKeyAlerts.show(saved.host, saved.port.toInt()) {
+                        // 信任新指纹后在同一个标签里接着重连（同掉线：dropCount 驱动 reconnectLoop）。
+                        if (!live.disposed) {
+                            live.state = LinkState.RECONNECTING
+                            live.dropCount++
+                        }
+                    }
+                ) {
+                    live.terminal?.writeNotice("重连失败：$text。请在弹出的对话框里核对主机指纹", SGR_RED)
+                    return
+                }
                 live.terminal?.writeNotice("重连失败：$text。请关闭此标签后手动重新连接", SGR_RED)
                 return
             }

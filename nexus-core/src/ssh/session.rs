@@ -294,9 +294,14 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
+        Self::with_known_hosts(KnownHosts::new())
+    }
+
+    /// 生产用的全局实例走这个：指纹表落盘到会话库（见 [`KnownHosts::persistent`]）。
+    pub fn with_known_hosts(known_hosts: KnownHosts) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
-            known_hosts: Arc::new(KnownHosts::new()),
+            known_hosts: Arc::new(known_hosts),
             auth_prompts: Arc::new(AuthPrompts::new()),
             shared: Arc::new(Mutex::new(HashMap::new())),
         }

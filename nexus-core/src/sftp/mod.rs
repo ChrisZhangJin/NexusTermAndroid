@@ -20,7 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::errors;
 use crate::listener::TerminalEventListener;
 use crate::ssh::session::{AuthContext, AuthMethod};
-use crate::ssh::{self, ClientHandler, KnownHosts, LegacyPolicy, OpenError};
+use crate::ssh::{self, ClientHandler, LegacyPolicy, OpenError};
 
 /// 单个远端目录项。与桌面版的 `RemoteEntry` 同构，字段名/形状不变——
 /// Kotlin 侧没有现成前端约定需要对齐，但保持同构方便将来对照桌面版排障。
@@ -232,7 +232,9 @@ pub fn sftp_connect(
             Err(ReuseError::Subsystem(e)) => return Err(e),
         }
     }
-    let known_hosts = Arc::new(KnownHosts::new());
+    // 和终端共用同一张（落盘的）指纹表：以前这里每次新建一张空表，独立拨号的 SFTP
+    // 等于完全不校验主机指纹。
+    let known_hosts = crate::manager().known_hosts();
     let prompts = Arc::new(ssh::prompt::AuthPrompts::new());
 
     let opened = crate::runtime()
