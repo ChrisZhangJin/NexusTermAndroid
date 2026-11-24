@@ -1,0 +1,10 @@
+# Android 15+ 要求 app 的 native .so 按 16KB 页对齐（ELF LOAD Align ≥ 0x4000），
+# 否则在 16KB 页设备上无法安装/加载。NDK r26 的链接器默认仍是 4KB（0x1000），
+# 这里显式把两个 Android 目标链接成 16KB 对齐。
+# （rust-android-gradle 插件不设置 RUSTFLAGS 环境变量，所以 config 的
+#   target.<triple>.rustflags 不会被覆盖、能生效——已通过 readelf 实证。）
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
